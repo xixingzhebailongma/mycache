@@ -1,0 +1,27 @@
+# Build output (CMake)
+/build/
+/build-asan/
+/cmake-build-*/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# Compiler / clangd / IDE
+.cache/
+.clangd/
+compile_commands.json
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude Code local settings (machine-specific — keep, don't commit)
+.claude/settings.local.json
+
+# Logs & runtime data (AOF/RDB persistence artifacts)
+*.log
+*.aof
+*.rdb
