@@ -153,6 +153,20 @@ DictEntry* Dict::Find(const void* key) const {
   return nullptr;
 }
 
+DictEntry* Dict::FindAndRehash(const void* key) {
+  if (Size() == 0) return nullptr;
+  RehashStep();  // 读路径也推进 rehash（对齐 Redis dictFind）
+  uint64_t h = KeyHash(key);
+  for (int t = 0; t <= 1; ++t) {
+    size_t idx = h & ht_[t].sizemask;
+    for (DictEntry* he = ht_[t].table[idx]; he; he = he->next) {
+      if (KeyEqual(key, he->key)) return he;
+    }
+    if (!Rehashing()) break;
+  }
+  return nullptr;
+}
+
 void* Dict::FetchValue(const void* key) const {
   DictEntry* e = Find(key);
   return e ? e->val : nullptr;

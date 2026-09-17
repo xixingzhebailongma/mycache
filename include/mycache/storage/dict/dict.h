@@ -34,8 +34,9 @@ uint64_t DictHash(const void* data, size_t len);
 
 // Redis 风格的字典：单独链地址 + 双哈希表 + 渐进式 rehash。
 //
-// - 查询（Find）是只读的，不会推进 rehash；rehash 仅在写路径（Add/Delete/Replace）
-//   通过 RehashStep 推进。这样上层可以用共享锁保护读、独占锁保护写。
+// - 查询分两种：const `Find` 只读、不推进 rehash（供共享锁读路径，如 Keyspace）；
+//   非 const `FindAndRehash` 先 RehashStep 再查两张表（供单线程读路径，如 Shard，
+//   对齐 Redis dictFind）。写路径（Add/Delete/Replace）始终通过 RehashStep 推进。
 // - 扩容/收缩通过 Expand 触发，分配 ht[1] 并把 rehashidx 置 0；之后每次写操作
 //   迁移少量桶，直到 ht[0] 清空后交换两表。
 //
@@ -48,7 +49,8 @@ class Dict {
   Dict& operator=(const Dict&) = delete;
 
   // ---- 查询 ----
-  DictEntry* Find(const void* key) const;   // 只读，不推进 rehash
+  DictEntry* Find(const void* key) const;   // 只读，不推进 rehash（共享锁读路径）
+  DictEntry* FindAndRehash(const void* key);  // 读路径先 RehashStep 再查（单线程 Shard 用）
   void* FetchValue(const void* key) const;
 
   // ---- 写入 ----

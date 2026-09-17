@@ -1,6 +1,6 @@
-# Architecture (Week 1)
+# 架构(第 1 周)
 
-## Threading model: main reactor + IO reactors
+## 线程模型:主 reactor + IO reactor
 
 ```
                   ┌───────────────┐
@@ -16,55 +16,53 @@
  └───────────┘     └───────────┘     └───────────┘
 ```
 
-- `EventLoop` — one epoll instance + an `eventfd` wakeup channel + a pending
-  functor queue. `RunInLoop`/`QueueInLoop` provide thread-safe hand-off.
-- `Channel` — fd + interest events + callbacks; a weak `tie` keeps the owner
-  alive during event dispatch (avoids use-after-free on close).
-- `Connection` — input/output `Buffer`, ET read-until-EAGAIN and
-  write-until-EAGAIN, graceful shutdown after flushing.
-- `Acceptor` — non-blocking listen fd; accepts until `EAGAIN`.
-- `IOReactor` — runs an `EventLoop` in a worker thread and owns its connections.
+- `EventLoop` —— 一个 epoll 实例 + 一个 `eventfd` 唤醒通道 + 一个待执行的
+  functor 队列。`RunInLoop`/`QueueInLoop` 提供线程安全的交接。
+- `Channel` —— fd + 关注的事件 + 回调;弱引用 `tie` 在事件分发期间维持所属对象
+  存活(避免 close 后的 use-after-free)。
+- `Connection` —— 输入/输出 `Buffer`,ET 读至 EAGAIN 与写至 EAGAIN,flush 之后
+  优雅关闭。
+- `Acceptor` —— 非阻塞的监听 fd;一直 accept 直到 `EAGAIN`。
+- `IOReactor` —— 在工作线程中运行一个 `EventLoop` 并拥有其连接。
 
-## Data flow for one command
+## 单条命令的数据流
 
-1. `Connection::HandleRead` drains the socket, then fires `MessageCallback`.
-2. `Server::OnMessage` parses one or more RESP commands from the input buffer.
-3. `Server::DispatchCommand` lowercases the name, looks it up in `CommandTable`,
-   checks arity, and invokes the handler with a `CommandContext`.
-4. The handler reads/writes the shared `Keyspace` and replies via
-   `conn->Send(...)`, which appends to the output buffer and enables `EPOLLOUT`.
+1. `Connection::HandleRead` 排空 socket,然后触发 `MessageCallback`。
+2. `Server::OnMessage` 从输入 buffer 中解析一条或多条 RESP 命令。
+3. `Server::DispatchCommand` 将命令名小写化,在 `CommandTable` 中查找,检查
+   arity,并以 `CommandContext` 调用处理函数。
+4. 处理函数读写共享的 `Keyspace`,并通过 `conn->Send(...)` 回复,后者把数据追加
+   到输出 buffer 并启用 `EPOLLOUT`。
 
-## Storage
+## 存储
 
-- `sds` — length-prefixed, binary-safe string; `len`/`alloc` in a header
-  (`sdshdr8/16/32/64`) right before the buffer, O(1) length and amortized append.
-- `Object` — refcounted Redis-style object. String values use one of two
-  encodings: `int` (long long inline in `ptr`) or `string` (separately allocated sds).
-- `Dict` — separate-chaining hash table holding two tables (`ht[0]`, `ht[1]`) for
-  progressive rehash. Grow/shrink allocate `ht[1]` and set `rehashidx`; each write
-  then migrates one bucket until `ht[0]` drains and the tables swap.
-- `Keyspace` — `std::shared_mutex`-guarded wrapper shared by all IO reactors.
-  Readers take a shared lock and are pure reads (no rehash); writers take an
-  exclusive lock and advance rehash one bucket per operation.
-- `allocator` / `MemoryStats` — a tracking allocator feeding `used_memory()`,
-  plus per-encoding object counts.
+- `sds` —— 带长度前缀、二进制安全的字符串;`len`/`alloc` 存放在紧邻 buffer 前面
+  的头部(`sdshdr8/16/32/64`)中,长度为 O(1),追加为均摊 O(1)。
+- `Object` —— 带引用计数的 Redis 风格对象。字符串值使用两种编码之一:
+  `int`(long long 内联在 `ptr` 中)或 `string`(单独分配的 sds)。
+- `Dict` —— 拉链法哈希表,持有两张表(`ht[0]`、`ht[1]`)用于渐进式 rehash。
+  扩容/缩容时分配 `ht[1]` 并设置 `rehashidx`;此后每次写操作迁移一个桶,直到
+  `ht[0]` 排空、两张表交换。
+- `Keyspace` —— 由 `std::shared_mutex` 保护、被所有 IO reactor 共享的封装。
+  读者取共享锁且为纯读(不 rehash);写者取独占锁,且每次操作推进一个桶的 rehash。
+- `allocator` / `MemoryStats` —— 一个追踪分配器,为 `used_memory()` 提供数据,
+  另加按编码分类的对象计数。
 
-## Key design decisions (Week 1 scope)
+## 关键设计决策(第 1 周范围)
 
-- One global `Keyspace` (locked) rather than per-shard storage; sharding comes
-  in a later week.
-- Replies are buffered and flushed in bulk, which is what makes pipelining cheap.
-- Signal handling uses an `eventfd` + a channel so `Stop()` runs on the loop
-  thread; `SIGPIPE` is ignored.
-- Rehash is advanced only on the write path (shared-lock reads never mutate the
-  dict), which keeps the `shared_mutex` model sound under concurrency.
+- 使用一个全局 `Keyspace`(加锁)而非每分片存储;分片放到后续周实现。
+- 回复被缓冲并批量 flush,这正是流水线(pipelining)廉价的原因。
+- 信号处理使用 `eventfd` + 一个 channel,使 `Stop()` 在 loop 线程上运行;
+  `SIGPIPE` 被忽略。
+- rehash 只在写路径上推进(共享锁读永远不会修改 dict),这使 `shared_mutex` 模型
+  在并发下保持健全。
 
-## Week 3: sharded execution + hash + TTL
+## 第 3 周:分片执行 + hash + TTL
 
-The single global `Keyspace` is replaced, at the command layer, by a set of
-shards. Each `Shard` owns an independent `dict` (sds -> Object*) and an
-`expires` dict (sds -> absolute expiry ms), and is only ever touched by its
-own `ShardWorker` thread, so no lock is needed.
+在命令层,单一的全局 `Keyspace` 被一组分片取代。每个 `Shard` 拥有独立的
+`dict`(sds -> Object*)和一个 `expires` 字典(sds -> 绝对过期毫秒数),并且只会被
+它自己的 `ShardWorker` 线程访问,因此无需加锁。分片让 `shared_mutex` 消失,于是
+读路径也改用 `Dict::FindAndRehash` 推进 rehash(对齐 Redis `dictFind`)。
 
 ```
                     ┌───────────────┐
@@ -83,25 +81,23 @@ own `ShardWorker` thread, so no lock is needed.
         └──── reply via Connection::Send (hops back to IO loop)
 ```
 
-- `CommandRouter` maps `key -> shard` with `DictHash(key) % shard_count` and
-  submits the command as a functor to the owning `ShardWorker`'s `EventLoop`.
-  Commands for the same key therefore execute in FIFO order on one thread.
-- The reply write-back path (`Worker -> IO Reactor`) is `Connection::Send`,
-  which detects the cross-thread call and re-queues onto the connection's IO
-  loop via `shared_from_this()` to keep the connection alive until flushed.
-- Keyless commands (`PING`, `ECHO`) run inline on the IO thread.
-- Hash values are `Object`s of type `kHash` whose `ptr` is a nested dict of
-  field (sds) -> value (Object*).
-- TTL uses lazy deletion (checked on every lookup) plus a simplified active
-  expire: each shard's `timerfd` fires every 100 ms and samples a few random
-  buckets of the `expires` dict, removing expired keys.
-- Known cuts this week: cross-shard `MGET`/`MSET` and `MULTI`; multi-key
-  `DEL`/`EXISTS` are routed by the first key and only affect that shard.
+- `CommandRouter` 用 `DictHash(key) % shard_count` 将 `key -> shard` 映射,并把命令
+  作为 functor 提交到所属 `ShardWorker` 的 `EventLoop`。因此同一 key 的命令在单个
+  线程上按 FIFO 顺序执行。
+- 回复回写路径(`Worker -> IO Reactor`)是 `Connection::Send`,它检测到跨线程调用后,
+  通过 `shared_from_this()` 重新入队到该连接的 IO loop,以在 flush 之前保持连接存活。
+- 无 key 命令(`PING`、`ECHO`)在 IO 线程上内联执行。
+- Hash 值是类型为 `kHash` 的 `Object`,其 `ptr` 是一个嵌套的字段(sds)-> 值(Object*)
+  字典。
+- TTL 采用惰性删除(每次查找时检查)加上一个简化的主动过期:每个分片的 `timerfd`
+  每 100 ms 触发一次,对 `expires` 字典随机采样若干桶,移除已过期 key。
+- 本周已知的裁剪:跨分片的 `MGET`/`MSET` 和 `MULTI`;多 key 的 `DEL`/`EXISTS`
+  按第一个 key 路由,只影响那个分片。
 
-## Week 4: AOF persistence + crash recovery
+## 第 4 周:AOF 持久化 + 崩溃恢复
 
-The sharded write path is extended with an append-only command log so the dataset
-survives a `kill -9`. See `docs/persistence.md` for the full design; the essentials:
+分片写路径被扩展为追加式命令日志,使数据集在 `kill -9` 后依然存活。完整设计见
+`docs/persistence.md`;要点如下:
 
 ```
  command ──► ShardWorker ──► mutate Shard ──► AofWriter::Append(record) ──► appendonly.aof
@@ -112,26 +108,24 @@ survives a `kill -9`. See `docs/persistence.md` for the full design; the essenti
    startup ──► AofRecovery::Replay ──► validate + replay + repair partial tail
 ```
 
-- `AofWriter` — one shared, mutex-guarded writer. Every record is `write()`n on
-  each append (so `kill -9` loses nothing); the fsync policy (`always`/`everysec`/
-  `no`) only controls how often the page cache is flushed. `everysec` runs a
-  background fsync thread.
-- `AofRecovery` — runs at startup before any shard worker thread starts, so it can
-  write directly into each `Shard` via `CommandRouter::ShardAt`. Each record is a
-  `[len][crc32][RESP command]` frame; a torn tail (partial write from `kill -9`) is
-  detected and truncated.
-- Write handlers (`SET`/`DEL`/`HSET`/`HDEL`/`EXPIRE`) log through
-  `CommandContext::aof`. TTL commands are translated to absolute `PEXPIREAT`, so
-  `Shard` expiry now uses wall-clock time (`UnixMs()`).
+- `AofWriter` —— 一个共享的、由 mutex 保护的写者。每次 append 都会 `write()` 每条
+  记录(因此 `kill -9` 不丢任何东西);fsync 策略(`always`/`everysec`/`no`)只控制
+  页缓存刷盘的频率。`everysec` 会运行一个后台 fsync 线程。
+- `AofRecovery` —— 在任何分片工作线程启动之前于启动阶段运行,因此可以通过
+  `CommandRouter::ShardAt` 直接写入每个 `Shard`。每条记录是一个
+  `[len][crc32][RESP command]` 帧;撕裂的尾部(`kill -9` 造成的部分写)会被检测到并
+  截断。
+- 写处理函数(`SET`/`DEL`/`HSET`/`HDEL`/`EXPIRE`)通过 `CommandContext::aof` 记录日志。
+  TTL 命令被翻译成绝对时间 `PEXPIREAT`,因此 `Shard` 的过期现在使用墙上时钟
+  (`UnixMs()`)。
 
-## Week 5: memory governance + metrics + list
+## 第 5 周:内存治理 + metrics + list
 
-### Eviction (per-shard, sampling-based)
+### 淘汰(每分片、基于采样)
 
-The Week 3 sharded design pays off here: each `Shard` is owned by exactly one
-`ShardWorker` thread, so eviction is a plain per-thread operation with **no storage
-locks on the hot path**. The flow for a memory-growing write (`SET`/`HSET`/`INCR`/
-`LPUSH`/`RPUSH`):
+第 3 周的分片设计在此得到回报:每个 `Shard` 恰好由一个 `ShardWorker` 线程拥有,
+所以淘汰是普通的每线程操作,热路径上**没有存储锁**。导致内存增长的写操作
+(`SET`/`HSET`/`INCR`/`LPUSH`/`RPUSH`)的流程如下:
 
 ```
 command ──► ShardWorker ──► EvictIfNeeded() ──► (over limit?)
@@ -140,36 +134,30 @@ command ──► ShardWorker ──► EvictIfNeeded() ──► (over limit?)
                                   │ yes + lru/random: EvictOne() loop until under
 ```
 
-- **One source of truth** — `used_memory()` from the tracking allocator. Per-shard
-  quota (`maxmemory/shard_count`) vs. per-shard usage (`used_memory()/shard_count`)
-  reduces to the *same* global comparison because keys are hash-distributed evenly, so
-  each shard simply checks the global water level against its own keys. The tradeoff
-  (a hot shard can over-evict its own keys while others are cold) is documented in
-  `docs/eviction.md`.
-- **Approximate LRU** — `Object` carries a `uint64_t lru` (Redis's robj model), set at
-  creation and refreshed on every lookup. A cached `LruClock()` (atomic, refreshed by
-  the 100 ms shard timer, mirroring Redis `serverCron`) keeps the hot path free of a
-  clock syscall per access. Eviction samples `maxmemory_samples` keys by random-bucket
-  walk over both hash tables and deletes the one with the smallest `lru`.
-- **Policies** — `noeviction` (default), `allkeys-lru`, `allkeys-random`,
-  `volatile-lru`, `volatile-random`. Volatile variants sample the `expires` dict so
-  only TTL-bearing keys are evicted.
+- **单一事实来源** —— 追踪分配器的 `used_memory()`。每分片配额
+  (`maxmemory/shard_count`)对比每分片用量(`used_memory()/shard_count`)可化简为
+  *同一个*全局比较,因为 key 被均匀哈希分布,所以每个分片只需对照自己的 key 检查
+  全局水位。其代价(热分片可能在别的分片还冷时过度淘汰自己的 key)记录在
+  `docs/eviction.md`。
+- **近似 LRU** —— `Object` 携带一个 `uint64_t lru`(Redis 的 robj 模型),在创建时
+  设置、每次查找时刷新。一个缓存的 `LruClock()`(原子变量,由 100 ms 分片定时器
+  刷新,对应 Redis 的 `serverCron`)使热路径免于每次访问都做时钟 syscall。淘汰时
+  对两张哈希表随机游走采样 `maxmemory_samples` 个 key,删除其中 `lru` 最小的那个。
+- **策略** —— `noeviction`(默认)、`allkeys-lru`、`allkeys-random`、`volatile-lru`、
+  `volatile-random`。volatile 变体采样 `expires` 字典,因此只会淘汰带 TTL 的 key。
 
 ### Metrics + INFO
 
-A process-wide `Metrics` singleton (atomics) tracks hits/misses, evicted/expired keys,
-commands, connections, and uptime. Each `Shard` also keeps atomic `key_count_`/
-`expire_count_` (maintained in `Set/Del/DeleteKey/ExpireAt/HSet/HDel`) so `INFO` can
-sum cross-shard key/expire counts from the IO thread without a data race. `INFO`
-(`monitor/info.cpp`) assembles server/clients/memory/stats/keyspace sections;
-`mem_fragmentation_ratio` is `RSS / used_memory` (RSS from `/proc/self/statm`).
+一个进程级的 `Metrics` 单例(原子变量)追踪命中/未命中、被淘汰/被过期 key、命令、
+连接和运行时长。每个 `Shard` 还维护原子的 `key_count_`/`expire_count_`(在
+`Set/Del/DeleteKey/ExpireAt/HSet/HDel` 中维护),使 `INFO` 能在 IO 线程上无数据竞争地
+汇总跨分片的 key/expire 计数。`INFO`(`monitor/info.cpp`)组装 server/clients/memory/
+stats/keyspace 各节;`mem_fragmentation_ratio` 为 `RSS / used_memory`(RSS 来自
+`/proc/self/statm`)。
 
-### List type + INCR
+### List 类型 + INCR
 
-`INCR`/`DECR`/`INCRBY`/`DECRBY` reuse the integer string encoding and AOF-log the
-absolute result as `SET` for deterministic replay. The list type is a plain
-doubly-linked list (`ListNode`/`List` in `storage/collection/list.cpp`) where every
-node and value goes through `zmalloc` so list memory is correctly counted by
-`used_memory()` — unlike a `std::deque`, which would bypass the tracking allocator.
-
-
+`INCR`/`DECR`/`INCRBY`/`DECRBY` 复用整数字符串编码,并把绝对结果以 `SET` 写入 AOF
+日志以实现确定性重放。list 类型是一个普通的双向链表(`storage/collection/list.cpp`
+中的 `ListNode`/`List`),其中每个节点和值都经过 `zmalloc`,因此 list 内存能被
+`used_memory()` 正确计数 —— 不像 `std::deque` 会绕过追踪分配器。

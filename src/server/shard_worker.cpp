@@ -68,6 +68,7 @@ void ShardWorker::OnTimer() {
   RefreshLruClock();           // 周期刷新 LRU 时钟（~100ms，与 Redis serverCron 一致）
   shard_.ActiveExpireCycle();
   shard_.EvictIfNeeded();      // 超限时的后台兜底淘汰（即便之后没有新写入）
+  shard_.IncrementalRehash(1);  // 空闲时也推进 rehash（对齐 Redis databasesCron）
 }
 
 }  // namespace mycache

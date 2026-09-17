@@ -38,7 +38,8 @@ ET 必须读到 EAGAIN 才算读干净，写也要写满。
 
 **Q2 渐进式 rehash**：双哈希表 ht[0]/ht[1]，扩容时分配 ht[1]、`rehashidx=0`，之后每次写
 操作迁移一个桶（`RehashStep`），读查两张表，直到 ht[0] 搬空再交换。好处是**分摊**，不会
-像一次性 rehash 那样阻塞服务。本项目读路径不推进 rehash，所以共享锁下读是纯只读。
+像一次性 rehash 那样阻塞服务。分片后 Shard 读路径用 `FindAndRehash` 也推进 rehash（对齐
+Redis `dictFind`）；只有 Week1 的 `Keyspace` 共享锁读路径保持纯只读。
 
 **Q3 TTL**：惰性删除（每次查 key 先看是否到期）+ 主动过期（timerfd 每 100ms 随机采样）。
 存**绝对时间戳**（`UnixMs` 墙钟）而非相对，这样 AOF 里记 `PEXPIREAT` 重放结果确定——

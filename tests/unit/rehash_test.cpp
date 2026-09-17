@@ -154,3 +154,57 @@ TEST(RehashTest, RehashCompletesAndSwapsTables) {
     EXPECT_EQ(v, i);
   }
 }
+
+// const Find 必须保持纯只读：反复查询也不推进 rehash（这是 Keyspace 共享锁读路径
+// 成立的契约）。
+TEST(RehashTest, ReadOnlyFindDoesNotAdvanceRehash) {
+  Dict d(TestType());
+  const int N = 1000;
+  for (int i = 0; i < N; ++i) AddKey(d, "key" + std::to_string(i), i);
+  while (d.Rehashing()) d.Rehash(1000);  // 先收敛到稳定态
+  ASSERT_FALSE(d.Rehashing());
+
+  ASSERT_EQ(d.Expand(2048), 0);
+  ASSERT_TRUE(d.Rehashing());
+  const long idx_before = d.RehashIndex();
+
+  for (int i = 0; i < N; ++i) {
+    sds k = MakeKey("key" + std::to_string(i));
+    DictEntry* e = d.Find(k);
+    mycache::sdsfree(k);
+    ASSERT_NE(e, nullptr) << "missing key " << i;
+  }
+  EXPECT_EQ(d.RehashIndex(), idx_before);  // Find 不推进 rehash
+  EXPECT_TRUE(d.Rehashing());
+}
+
+// 分片后读路径用 FindAndRehash：只读（无 Add/Delete）也必须能把 rehash 搬完，
+// 否则读多写少的负载下 rehash 永远结束不了。
+TEST(RehashTest, FindAndRehashDrainsRehash) {
+  Dict d(TestType());
+  const int N = 1000;
+  for (int i = 0; i < N; ++i) AddKey(d, "key" + std::to_string(i), i);
+  while (d.Rehashing()) d.Rehash(1000);
+  ASSERT_FALSE(d.Rehashing());
+
+  ASSERT_EQ(d.Expand(2048), 0);
+  ASSERT_TRUE(d.Rehashing());
+
+  // 只走读路径推进，不调用 Add/Delete/Replace。
+  int guard = 0;
+  const int kMaxSteps = 200000;  // 上限防死循环；每步推进 1 个桶
+  while (d.Rehashing() && guard++ < kMaxSteps) {
+    sds k = MakeKey("key" + std::to_string(guard % N));
+    DictEntry* e = d.FindAndRehash(k);
+    mycache::sdsfree(k);
+    ASSERT_NE(e, nullptr) << "missing key during rehash";
+  }
+  EXPECT_FALSE(d.Rehashing());
+
+  // rehash 结束后数据完整、值正确。
+  for (int i = 0; i < N; ++i) {
+    long v = -1;
+    ASSERT_TRUE(Lookup(d, "key" + std::to_string(i), &v));
+    EXPECT_EQ(v, i);
+  }
+}

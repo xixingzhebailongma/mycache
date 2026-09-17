@@ -52,6 +52,11 @@ bool Shard::EvictOne() {
   return removed;
 }
 
+void Shard::IncrementalRehash(int ms) {
+  dict_.RehashMilliseconds(ms);
+  expires_.RehashMilliseconds(ms);
+}
+
 std::vector<DictEntry*> Shard::SampleCandidates() {
   size_t n = eviction_.maxmemory_samples > 0
                  ? static_cast<size_t>(eviction_.maxmemory_samples)
@@ -81,7 +86,7 @@ sds Shard::PickVictim(const std::vector<DictEntry*>& candidates) {
         o = static_cast<Object*>(e->val);
       } else {
         // volatile：e 来自 expires_，val 是到期时间戳；去 dict_ 查对象。
-        DictEntry* de = dict_.Find(e->key);
+        DictEntry* de = dict_.FindAndRehash(e->key);
         if (de) o = static_cast<Object*>(de->val);
       }
       uint64_t lru = o ? o->lru : 0;
@@ -107,7 +112,7 @@ bool Shard::DeleteKey(sds key) {
 }
 
 bool Shard::ExpireIfNeeded(sds key) {
-  DictEntry* e = expires_.Find(key);
+  DictEntry* e = expires_.FindAndRehash(key);
   if (!e) return false;
   int64_t when = static_cast<int64_t>(reinterpret_cast<intptr_t>(e->val));
   if (UnixMs() < when) return false;
@@ -118,7 +123,7 @@ bool Shard::ExpireIfNeeded(sds key) {
 
 Object* Shard::LookupValue(sds key) {
   if (ExpireIfNeeded(key)) return nullptr;
-  DictEntry* e = dict_.Find(key);
+  DictEntry* e = dict_.FindAndRehash(key);
   if (!e) return nullptr;
   Object* o = static_cast<Object*>(e->val);
   o->lru = LruClock();  // 访问即刷新 LRU
@@ -209,7 +214,7 @@ bool Shard::HGet(const std::string& key, const std::string& field, std::string* 
   }
   Dict* hd = HashDict(o);
   sds f = sdsnewlen(field.data(), field.size());
-  DictEntry* e = hd->Find(f);
+  DictEntry* e = hd->FindAndRehash(f);
   sdsfree(f);
   bool found = e != nullptr;
   if (found) *out = static_cast<Object*>(e->val)->ToString();
@@ -417,7 +422,7 @@ int64_t Shard::TtlMs(const std::string& key) {
     sdsfree(k);
     return -2;
   }
-  DictEntry* e = expires_.Find(k);
+  DictEntry* e = expires_.FindAndRehash(k);
   if (!e) {
     sdsfree(k);
     return -1;

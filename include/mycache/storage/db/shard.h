@@ -37,6 +37,10 @@ class Shard {
   bool EvictIfNeeded();
   // 按策略淘汰单个 key（内部被 EvictIfNeeded 调用；公开以便测试验证淘汰顺序）。
   bool EvictOne();
+  // 按时间预算推进 rehash（对齐 Redis databasesCron 的 incrementallyRehash）：
+  // 空闲时也保证进行中的 rehash 能收敛，避免 ht[0]/ht[1] 双表常驻。仅由其
+  // 归属的 ShardWorker 线程在定时器里调用。
+  void IncrementalRehash(int ms);
 
   // ---- string ----
   bool Get(const std::string& key, std::string* out);
