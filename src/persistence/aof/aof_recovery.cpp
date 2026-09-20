@@ -208,6 +208,26 @@ bool ApplyAofCommand(Shard* shard, const std::string& name,
     shard->ExpireAt(args[0], static_cast<int64_t>(when));
     return true;
   }
+  if (name == "lpush" && args.size() >= 2) {
+    std::vector<std::string> values(args.begin() + 1, args.end());
+    shard->LPush(args[0], values);
+    return true;
+  }
+  if (name == "rpush" && args.size() >= 2) {
+    std::vector<std::string> values(args.begin() + 1, args.end());
+    shard->RPush(args[0], values);
+    return true;
+  }
+  if (name == "lpop" && args.size() == 1) {
+    std::string out;
+    shard->LPop(args[0], &out);
+    return true;
+  }
+  if (name == "rpop" && args.size() == 1) {
+    std::string out;
+    shard->RPop(args[0], &out);
+    return true;
+  }
   return false;
 }
 

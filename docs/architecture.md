@@ -91,8 +91,8 @@
   字典。
 - TTL 采用惰性删除(每次查找时检查)加上一个简化的主动过期:每个分片的 `timerfd`
   每 100 ms 触发一次,对 `expires` 字典随机采样若干桶,移除已过期 key。
-- 本周已知的裁剪:跨分片的 `MGET`/`MSET` 和 `MULTI`;多 key 的 `DEL`/`EXISTS`
-  按第一个 key 路由,只影响那个分片。
+- 本周已知的裁剪：`MULTI`（事务）。`MGET`/`MSET`/多 key 的 `DEL`/`EXISTS` 在 Week 8
+  补上了 scatter-gather（跨 shard 不保证原子，见第 8 周）。
 
 ## 第 4 周:AOF 持久化 + 崩溃恢复
 
@@ -161,3 +161,85 @@ stats/keyspace 各节;`mem_fragmentation_ratio` 为 `RSS / used_memory`(RSS 来�
 日志以实现确定性重放。list 类型是一个普通的双向链表(`storage/collection/list.cpp`
 中的 `ListNode`/`List`),其中每个节点和值都经过 `zmalloc`,因此 list 内存能被
 `used_memory()` 正确计数 —— 不像 `std::deque` 会绕过追踪分配器。
+
+## 第 6 周:AOF rewrite + RDB + io_uring
+
+### AOF rewrite(fork + COW + rewrite buffer)
+
+Week 4 的 AOF 日志只增不减、无限增长。rewrite fork 出一个子进程,基于 COW 快照把当前数据
+集压缩成一份紧凑基线;父进程用 rewrite buffer 捕获 rewrite 期间的并发写入,子进程退出后
+合并 + 原子 rename 替换旧日志:
+
+```
+BGREWRITEAOF ──► SnapshotGate(exclusive) ──► BeginRewrite ──► fork
+                     ├─ 子进程:遍历各 shard 无分配编码 → temp → fsync → _exit(0)
+                     └─ 父进程:rewrite buffer 接住 fork 后写入 → SIGCHLD → 合并 → rename → 换 fd
+```
+
+- **fork 安全(多线程)** —— 子进程里只剩调用线程,其余 shard worker / IO reactor 消失。子进程
+  全程**无分配**(fork 前预分配 buffer + `::write`/`::fsync` + `_exit`),否则 malloc 锁可能因被
+  消失的线程持有而永久死锁。
+- **快照一致性** —— `SnapshotGate`(`shared_mutex`)保证 fork 时没有 shard 任务在途,避免读到
+  rehash 半搬迁的"撕碎"dict。所有 shard 命令/定时器持 shared 锁,fork 前持 exclusive 锁。
+- **无缝隙衔接** —— `BeginRewrite` 在 fork 前、排空后置位,rewrite buffer 恰好只装 fork 之后
+  的写入;合并 + rename + 换 fd 全程持 AofWriter 的 `mu_`。
+- 完整逐段讲解 + 自查题见 `docs/code-reading-week6.md`。
+
+### RDB(SAVE / BGSAVE + 启动加载)
+
+简化的二进制快照(`MYRDB001` magic + 逐 key `[len][crc][payload]` 记录 + EOF,复用
+`aof::Crc32`)。`SAVE` 持闸门 exclusive 锁后在调用线程单线程写(阻塞、可自由分配);`BGSAVE`
+fork 子进程写(不阻塞、子进程无分配)。两者都写 temp 再原子 `rename`,崩溃不会留下半截快照。
+启动时 AOF 优先,否则加载 RDB。
+
+### IOEngine 抽象 + io_uring
+
+`AofWriter` 的 open/write/fsync/pread/ftruncate/close 抽成 `IOEngine` 接口;`PosixIO` 封装
+libc 调用,`UringIO`(liburing)把 write/fsync 换成 io_uring 提交/完成。`io_engine posix|io_uring`
+配置切换,未装 liburing 时回退 posix。当前是同步 submit/wait 封装(打通路径 + 压测对比),真正
+的收益在批提交多个 SQE。
+
+## 第 7 周:性能 + 稳定性
+
+第 7 周不做存储层改动,聚焦「达标 + 证明无泄漏/无竞争」。完整数据见
+`docs/benchmark-week7.md`,架构层面两个落点:
+
+### jemalloc(替换 glibc malloc)
+
+`zmalloc`(`src/storage/memory/allocator.cpp`)只包装 `std::malloc/free` + `malloc_usable_size`,
+因此链接 jemalloc 后这些符号被透明拦截,**引擎代码零改动**。`CMakeLists.txt` 新增
+`MYCACHE_USE_JEMALLOC`(默认 ON),用 `find_file` 探测 dev 包的 `libjemalloc.so` 或运行时包的
+`libjemalloc.so.2`(Ubuntu 装在 `/usr/lib/<multiarch>`,需 `-print-multiarch` 给 HINTS)。
+
+收益:每线程 tcache 让 8 shard worker + 4 IO reactor 并发分配不再争抢 glibc arena 锁(吞吐
++2~3%);碎片率(`RSS/used_memory`)略降。代价:jemalloc 的 `malloc_usable_size` 按更粗 size
+class 上取整,`used_memory` 偏大、短期 RSS 略高——这是 Redis 也接受的取舍。
+
+### TSan 数据竞争验证
+
+`MYCACHE_ENABLE_TSAN=ON` 新增 `-fsanitize=thread`。单测(多为单线程)跑不出竞争,真正的验证是
+把**服务端**跑在 TSan 下打并发:50 并发 `get,set,incr,lpush` + 填满 `maxmemory` 触发淘汰 +
+`BGSAVE`(fork + `SnapshotGate`)——0 warning。这反过来证实了第 3 周「每 shard 一个 worker、
+跨线程交接走 `RunInLoop` 入队」的锁纪律。TSan 在 Linux 6.x 高熵 ASLR 下需 `setarch -R`
+关 ASLR。
+
+### 性能画像(记录在案,未改)
+
+callgrind 采样显示热路径 = 分配(`malloc_usable_size` 7.5% 最大单项)+ 哈希(`DictHash`)+ sds
+操作,**无锁**。追踪分配器每次 alloc/free 都调 `malloc_usable_size` 是最大单项开销,后续可仿
+Redis 把 usable size 存进块头(`PREFIX_SIZE`)、`zfree` 直接读头省掉该调用。
+
+## 第 8 周：多 key 命令的 scatter-gather
+
+Week 3 留下的「跨 shard 多 key」在 Week 8 补齐（`DEL`/`EXISTS`/`MGET`/`MSET`）。
+
+- **命令元数据**：`Command` 增加 `last_key`（<0 到末尾、>0 显式末尾、0 单/无 key）与
+  `key_step`（MSET 的 key/value 交替为 2）。
+- **扇出**：`CommandRouter::RouteTo(idx)` 支持派发到指定 shard；`multi_key.{h,cpp}` 提供
+  `GroupKeysByShard`（按哈希分组、保留下标）与 `FanOut`（原子 countdown latch，无锁扇入）。
+- **汇总**：`DEL`/`EXISTS` 原子累加，`MGET` 按 key 位置回填（`results[i]`），`MSET` 逐 shard
+  `SET` + OOM 标志。
+- **不加锁的理由**：每个 shard 写自己那格、`fetch_sub` 到 0 者回包；跨 shard **不保证原子**
+  （MGET 拿不到一致快照、MSET 崩溃可能只应用部分 key）。
+- **AOF 的坑**：恢复用 `ShardIndex(args[0])` 路由每条记录，所以多 key 写必须**逐 shard 记
+  日志**（`DEL <该 shard key>`、`MSET` → 逐条 `SET`），否则跨 shard 的 key 回放漏删/漏写。

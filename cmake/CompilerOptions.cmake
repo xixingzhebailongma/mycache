@@ -10,3 +10,9 @@ endif()
 if(MYCACHE_ENABLE_SANITIZERS)
   include(cmake/Sanitizer.cmake)
 endif()
+
+# ThreadSanitizer：数据竞争检测（Week 7 稳定性验收的「无数据竞争」）。
+if(MYCACHE_ENABLE_TSAN)
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=thread)
+endif()

@@ -101,13 +101,18 @@ key，越接近真实 LRU。**`maxmemory_samples=1` → 退化成 allkeys-random
 
 ## 第 3 轮 · 边界与故障
 
-### Q1. 跨 shard 多 key 命令的问题
-**要点**：`DEL a b c` / `EXISTS a b c` 按 `first_key=1` 只落在 `a` 的 shard，`b`/`c` 若哈希到
-别的 shard **根本不会被删/算**，命令却照常返回（还返回错的计数）。
-`MGET`/`MSET` 难的不是「不能拆发」（scatter-gather 很简单），是**跨 shard 原子性/一致性**：
-各 shard 独立线程、在略微不同时刻执行，无法给出一个一致快照。要一致就得跨 shard 加锁（毁掉
-无锁设计）或全局时间戳/MVCC——本质退回单线程。**Redis 的 MGET 免费，是因为它单线程；分片用
-并发换来的代价就是跨 key 原子性。**
+### Q1. 跨 shard 多 key 命令（已实现 scatter-gather）
+**要点**：`DEL`/`EXISTS`/`MGET`/`MSET` 已实现跨 shard 路由。做法：按 key 哈希分组，把每个 shard
+的 key 拆成子命令派发到对应 shard 线程，异步汇总后回包——`DEL`/`EXISTS` 是**求和**（原子累加），
+`MGET` 是**按 key 位置回填**（顺序靠下标，不靠完成顺序），`MSET` 逐 shard `SET`。汇总用
+**countdown latch（原子计数）+ 按位写**，**不加锁**（各 shard 写自己那格，最后 `fetch_sub` 到 0
+的线程回包）。
+**关键取舍：跨 shard 不保证原子**——各 shard 独立线程、在略微不同时刻执行，`MGET` 拿不到一个
+一致快照，`MSET` 崩溃时可能只应用了部分 key。要一致就得跨 shard 加锁（毁掉无锁设计）或
+MVCC/全局时间戳——本质退回单线程。**Redis 的 MGET 免费，是因为它单线程；分片用并发换来的
+代价就是跨 key 原子性。**
+AOF 恢复的坑：恢复按**首 key** 路由每条记录，所以多 key 命令必须**逐 shard 记日志**（`DEL`
+记成逐 shard 的 `DEL <该 shard key>`、`MSET` 记成逐条 `SET`），否则跨 shard 的 key 回放时会漏。
 
 ### Q2. 为什么 INCR 记成 SET、EXPIRE 记成 PEXPIREAT？
 **要点**：`INCR` 是「读当前值 +1 写回」，结果依赖当前状态；直接记 `INCR` 重放**非幂等**（重放
@@ -179,9 +184,10 @@ header 布局是 `{len; alloc; flags; buf[]}`，`sds` 指向 `buf`，前一个�
 覆盖写 refcount 少减导致的泄漏 / AOF torn-tail 边界判定。挑一个能完整复述定位过程的。
 
 ### BQ2. 重来一次改哪个决策
-**参考**：「我会一开始就认真设计多 key 命令的路由，而不是用 `first_key` 这种单 key 简化——
-后来发现 MGET/MSET 几乎补不上，`DEL a b c` 还悄悄漏删。这是我最后悔的一个偷懒。」（要换成
-你自己的真实判断，别背原话。）
+**参考**：「我会一开始就把命令路由层设计成支持多 key——`Command` 带 key spec（first_key /
+last_key / step），而不是先写死 `first_key` 单 key。结果多 key 命令（DEL/EXISTS/MGET/MSET）是
+Week 8 才返工补的 scatter-gather，还顺带暴露了『AOF 恢复按首 key 路由、多 key 必须逐 shard
+记日志』这个隐蔽坑。」（要换成你自己的真实判断，别背原话。）
 
 ### BQ3. 数字的诚实（13 万 QPS / 60%）
 **模板**：「13 万是 pipelined 口径——每个客户端一次灌大量命令、批量回包，测的是服务端吞吐
@@ -196,6 +202,73 @@ header 布局是 `{len; alloc; flags; buf[]}`，`sds` 指向 `buf`，前一个�
 
 ---
 
+## Week 6/7 新增专题（AOF rewrite / RDB / io_uring / LFU / jemalloc）
+
+> 这五题是 Week 6/7 加进来的、面试官在「项目经历」环节最可能往深挖的新面。前三题是**实现了的
+> 功能**，后两题是**没实现但被点名**的对比题。
+
+### Q1. AOF rewrite 为什么需要、怎么做到不丢数据？
+
+**为什么需要**：AOF 只增不减，`SET k v` 重复 100 次就累积 100 条记录，文件无限膨胀、重启回放
+越来越慢。rewrite 把「当前数据集」压缩成「每个 key 只写最新状态」的紧凑基线。
+
+**原理 fork + COW**：`BGREWRITEAOF` fork 子进程，子进程基于 COW 快照遍历各 shard 把当前数据
+写进临时文件（父进程继续服务），写完 fsync 后 `_exit`。父进程收到 SIGCHLD 后合并 + 原子 `rename`
+替换旧 AOF。
+
+**三个关键难点**（每个都能被追问）：
+1. **fork 安全（多线程）**——fork 后子进程里只剩调用 fork 的那个线程，其余 shard worker / IO
+   reactor 都消失了。若子进程里 malloc/free，可能因 malloc 锁被「已消失的线程」持有而**永久
+   死锁**。所以子进程**全程无分配**：fork 前预分配 buffer + `::write`/`::fsync` + `_exit`
+   （不跑 atexit）。
+2. **rewrite buffer**——fork 之后父进程的并发写入进不了子进程的快照，父进程开一个 buffer 接住
+   fork 后的所有写；子进程写完后把这些 buffer 合并进临时文件再 rename，**fork→rename 之间的写
+   一条不丢**。
+3. **快照一致性**——fork 瞬间必须没有任何 shard 任务在途（否则子进程读到 rehash 搬一半的
+   「撕碎」dict）。用 `SnapshotGate`（shared_mutex）：shard 命令/定时器持 shared 锁，fork 前持
+   exclusive 锁。
+
+**与 fsync 的关系**：rewrite 期间新写入**照常走 AOF append**（不中断），rewrite 只是额外产出一
+份紧凑基线，两者独立。
+
+### Q2. RDB 和 AOF 区别、为什么生产两者都开？
+
+**要点**：RDB 是「某一时刻的数据集二进制快照」（`SAVE` 阻塞 / `BGSAVE` fork 写，都写 temp +
+原子 rename），AOF 是「重放命令日志」。RDB 文件小、加载快，但两次快照之间断电丢得多；AOF 丢
+得少但文件大、回放慢。生产（Redis）通常两者都开：RDB 做冷备 + 快速加载，AOF 做细粒度恢复。
+启动加载优先级：**AOF 优先**（丢得少），否则加载 RDB。
+
+### Q3. io_uring 是什么、和 epoll 什么关系、什么时候有收益？
+
+**要点**：io_uring 是 Linux 异步 IO 新接口，用 SQ（提交队列）/CQ（完成队列）两个 ring buffer
+在用户态与内核态共享，提交 batch SQE、收割 batch CQE，避免了 libaio 的 buffer 对齐/O_DIRECT
+限制。
+**与 epoll 的关系**：epoll 是「**就绪**通知」（数据可读/可写了告诉你，read/write 本身还是同步
+syscall）；io_uring 是「**完成**通知」（把要读写的 buffer+位置提交进去，内核异步完成）。
+**收益在批提交**：把很多 write/fsync 攒成一批 SQE 一次 submit，内核批量完成，省掉每条一次
+syscall + 上下文切换。本项目当前是「同步 submit + 等待完成」的封装（先打通路径），单条
+write+fsync 实测 posix 186 vs io_uring 191 ops/s 基本持平——**真正的收益在批提交多个 SQE（未
+实现）**，这正是要主动承认的「已完成 vs 未完成」边界。
+
+### Q4. LFU 和 LRU 的区别？为什么先做 LRU？
+
+**要点**：LRU 按「时间远近」淘汰（最近最少用），LFU 按「访问频率」淘汰（最不常用）。
+**LRU 的盲区**：一个 key 刚被访问过一次（很新）就在 LRU 里排最前，哪怕它长期只被访问这一次；
+LFU 用计数区分「偶发一次」和「长期高频」。LFU 适合热点稳定、要保护高频 key 的场景。
+**为什么先做 LRU**：时间戳即可近似实现（采样淘汰最旧），覆盖绝大多数缓存场景；LFU 需要计数 +
+**衰减**（否则历史访问次数永不下降，Redis 用 8bit Morris counter + 概率递增 + lfu-decay），
+复杂度高一个量级。本项目 `lfu.h` 是 stub，只实现了 LRU。
+
+### Q5. 为什么换 jemalloc？怎么换的？代价？
+
+**要点**：多线程下 glibc malloc 的 arena 锁争用 + 碎片。jemalloc 有每线程 tcache（减跨线程
+争用）+ size class 隔离（降碎片）。**怎么换**：`zmalloc` 只包装 `malloc/free/malloc_usable_size`，
+链接 jemalloc 后这些符号被透明拦截，**引擎代码零改动**。实测 QPS +2~3%、碎片率略降；**代价**
+是 jemalloc 的 `malloc_usable_size` 按更粗 size class 上取整，`used_memory` 偏大、短期 RSS 略
+高（用内存换低碎片 + 高并发，Redis 也接受）。
+
+---
+
 ## 附录 · 高频陷阱清单（面试官顺手就戳的细节）
 
 - **TTL 命令取整**：`TTL` 返回秒用 `(ms+500)/1000` **四舍五入**，Redis 是向下取整——小偏差，但
@@ -205,13 +278,17 @@ header 布局是 `{len; alloc; flags; buf[]}`，`sds` 指向 `buf`，前一个�
 - **rehash 阈值**：扩容 load factor ≥ 1.0（Redis 还有 dict_can_resize 和 5.0 强制路径）；缩容
   < 1/8（Redis 是 0.1）。
 - **lru 是 64 位 ms**：绕开了 Redis 24 位 lru 时钟约 194 天的回绕问题。
-- **`SET` 固定 arity 3**：无 NX/XX/EX/PX/GET 选项；无 SETEX/SETNX/APPEND/STRLEN/MGET/MSET。
+- **`SET` 固定 arity 3**：无 NX/XX/EX/PX/GET 选项；无 SETEX/SETNX/APPEND/STRLEN。
+  （`MGET`/`MSET` 已实现，见第 3 轮 Q1。）
 - **`DEL`/`EXISTS` 多 key 只作用第一个 key 的 shard**（见第 3 轮 Q1）。
 - **`INCR` 溢出检查**：用 `__builtin_add_overflow`。
 - **哈希函数**：MurmurHash64A（路由和 bucket 层同一个，只是用法不同）。
-- **空占位头文件**：LFU、RDB（loader/writer/snapshot）、AOF rewrite、io_uring、zset、set、
-  `Keyspace`（Week1 遗留）、`persistence_manager` 等——都是 stub/死代码，被问「支持 X 吗」时
-  别答错。
+- **仍是 stub 的**：`LFU`（`lfu.h` 只有注释）、`zset`、`set` 集合类型、`Keyspace`（Week1 遗留
+  死代码，服务端不再引用）。被问「支持 LFU / zset / set 吗」→ **没实现**，但要说清为什么 + 如果要
+  做怎么做。
+- **Week 6 已实现的**（别再答成「不支持」）：`RDB`（`src/persistence/rdb/` loader/writer）、
+  `AOF rewrite`（`aof_rewrite.cpp`）、`io_engine`（`src/io/`，posix + io_uring 同步封装）、
+  `persistence_manager`（AOF/RDB 编排）。
 - **错误文案**：协议错误返回的「invalid multibulk length」是照抄 Redis 的文案，但本项目是 RESP
   parser 不是 multibulk——小瑕疵。
 - **`keyspace.cpp` 是死代码**：被 shard 取代，服务端不再引用。

@@ -31,6 +31,9 @@ class CommandRouter {
   // 把任务提交到 key 对应的 shard worker（在其线程上执行）。
   void Route(const std::string& key, std::function<void(Shard*)> fn);
 
+  // 把任务提交到指定下标的 shard worker（多 key 命令扇出用）。
+  void RouteTo(size_t shard_index, std::function<void(Shard*)> fn);
+
  private:
   std::vector<std::unique_ptr<ShardWorker>> shards_;
 };

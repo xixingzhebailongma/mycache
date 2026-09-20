@@ -6,6 +6,7 @@
 
 #include "mycache/common/logger.h"
 #include "mycache/eviction/lru.h"
+#include "mycache/persistence/snapshot_gate.h"
 
 namespace mycache {
 
@@ -65,10 +66,14 @@ void ShardWorker::OnTimer() {
   uint64_t expirations = 0;
   ssize_t n = ::read(timer_fd_, &expirations, sizeof expirations);
   (void)n;
-  RefreshLruClock();           // 周期刷新 LRU 时钟（~100ms，与 Redis serverCron 一致）
+  // 定时器也会改 shard（过期/淘汰/rehash），同样持快照闸门的 shared 锁。
+  auto& gate = GlobalSnapshotGate();
+  gate.LockShared();
+  RefreshLruClock();            // 周期刷新 LRU 时钟（~100ms，与 Redis serverCron 一致）
   shard_.ActiveExpireCycle();
-  shard_.EvictIfNeeded();      // 超限时的后台兜底淘汰（即便之后没有新写入）
+  shard_.EvictIfNeeded();       // 超限时的后台兜底淘汰（即便之后没有新写入）
   shard_.IncrementalRehash(1);  // 空闲时也推进 rehash（对齐 Redis databasesCron）
+  gate.UnlockShared();
 }
 
 }  // namespace mycache

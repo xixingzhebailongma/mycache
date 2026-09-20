@@ -1,10 +1,10 @@
 # mycache 全项目代码阅读方案
 
-本文是一份**贯穿 Week1–5 的阅读地图**：把 ~50 个源文件按依赖顺序排好，逐文件给出「需要
+本文是一份**贯穿 Week1–6 的阅读地图**：把 ~50 个源文件按依赖顺序排好，逐文件给出「需要
 知道的点」，并明确标出哪些文件是**脚手架/未接入的死文件**（可以直接跳过）。
 
 - 已有单周深度复盘的，本文只给一句话 + 链接，不重复：`code-reading-week4.md`（AOF）、
-  `code-reading-week5.md`（淘汰/监控/list）。
+  `code-reading-week5.md`（淘汰/监控/list）、`code-reading-week6.md`（AOF rewrite/RDB/io_uring）。
 - 高层「是什么/为什么」看 `architecture.md`；本文讲「代码在哪、按什么顺序读、每段要懂什么」。
 - 建议配合 `./build/mycache_tests`（78 个单测）一起看：读完一个模块就点开对应的 `tests/unit/*_test.cpp` 验证理解。
 
@@ -127,7 +127,7 @@
 | `server/shard_worker.h` + `.cpp` | 每 shard 一线程 + timerfd 周期任务 |
 | `server/server.h` + `.cpp` | ★装配：`Start`/`InitAof`/`OnMessage`/`DispatchCommand`/`Stop` |
 
-### Phase 10 持久化（复用 Week4 深挖，此处只链接）
+### Phase 10 持久化（复用 Week4/Week6 深挖，此处只链接）
 | 文件 | 作用 |
 |------|------|
 | `persistence/aof/aof_format.h` + `.cpp` | 记录格式：magic + `[len][crc32][RESP]` |
@@ -519,11 +519,16 @@
 3. `DispatchCommand`（`:209`）：小写命令名 → 查表 → arity 校验 → `IncrCommands` → 按 `first_key` 决定**路由到 shard**（带 aof/config/router 进 context）还是 **IO 线程直接执行**（`db=nullptr`）。
 4. `Stop`（`:120`）优雅关闭：停 acceptor → 停 IO reactor → 停 shard worker → 关 AOF（flush+fsync）→ quit 主循环。顺序反过来拆。
 
-### 3.10 持久化（详见 `code-reading-week4.md`）
+### 3.10 持久化（详见 `code-reading-week4.md` / `code-reading-week6.md`）
 
 `aof_format`（记录格式 `[len][crc32][RESP]`）→ `aof_writer`（三种 fsync 策略 + 后台线程）→
 `aof_recovery`（启动重放 + 三条损坏判断 + 尾部截断）。这一整块 Week4 已经逐段讲过，读代码时
 配合 `code-reading-week4.md` 第 4 节的逐段讲解和第 5 节自查题即可，这里不重复。
+
+Week6 在之上新增 rewrite / RDB / IOEngine：`aof_rewrite`（fork + COW 无分配子进程）、
+`rdb_writer/rdb_loader`（二进制快照）、`io_engine` + `posix_io`/`uring_io`（可切换 I/O）、
+`snapshot_gate`（fork 前的快照闸门）、`persistence_manager`（协调 fork/SIGCHLD/收尾）。逐段
+讲解与自查题见 `code-reading-week6.md`。
 
 ---
 
@@ -538,10 +543,7 @@
 | `eviction/lfu.h` | LFU 未实现，只留枚举占位 |
 | `storage/collection/zset.h` | zset 未实现（无 .cpp） |
 | `expire/{expire_manager,timer_wheel,ttl_index}.h` | 过期只走了 `Shard::expires_` 的惰性/主动删除，这些是未启用的抽象 |
-| `persistence/rdb/{rdb_loader,rdb_writer,snapshot}.h` | RDB 持久化未实现 |
-| `persistence/aof/aof_rewrite.h` | AOF 重写未实现 |
-| `persistence/persistence_manager.h` + `.cpp` | 包装层未接入（server 直接用 AofWriter/AofRecovery） |
-| `io/{io_engine,posix_io,uring_io}.h`（含 `.cpp`） | io 抽象未用；server 直接用 `epoll_poller` |
+| `persistence/rdb/snapshot.h` | 快照遍历没独立成文件（Week6 把 `ScanSnapshot` 直接放进 `shard.h/.cpp`），此头未用 |
 | `monitor/slowlog.h` | 慢日志未实现 |
 | `storage/db/database.h` | 未实现（空壳） |
 | `storage/memory/memory_pool.h` | 内存池未接入（分配器直接 malloc） |

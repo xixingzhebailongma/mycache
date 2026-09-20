@@ -1,4 +1,4 @@
-# 简历 & 面试准备（Week 5）
+# 简历 & 面试准备（Week 8 更新版）
 
 ## 1. 简历 bullet（可直接裁剪）
 
@@ -8,16 +8,20 @@
   worker），流水线批量回包，`redis-benchmark` GET/SET/INCR/LPUSH 达 **13 万 QPS、亚毫秒
   P99**（同机原生 Redis 的 ~60%）。
 - 存储引擎：SDS 二进制安全字符串、渐进式 rehash 的哈希表（双表 + 逐步迁移）、引用计数
- 对象（int/string/list/hash 编码），百万 key 压测内存稳定。
+ 对象（int/string/list/hash 编码），百万 key 压测内存稳定；**无锁分片**（key 哈希路由到
+ 固定 worker，同 key 串行执行）。
 - 内存治理：实现 5 种 maxmemory 淘汰策略（noeviction/allkeys-lru/random/volatile-*），
-  **近似 LRU 采样淘汰**（采样 N 个 key 淘汰最旧）+ 缓存 LRU 时钟，到上限自动淘汰不 OOM。
+  **近似 LRU 采样淘汰** + 缓存 LRU 时钟，到上限自动淘汰不 OOM；接入 **jemalloc** 降碎片。
 - 持久化：AOF 追加日志（always/everysec/no 三档 fsync）+ CRC32 校验 + 半条记录截断修复，
-  `kill -9` 不丢数据。
-- 工程化：INFO 命令（内存/碎片率/命中率）、ASan/UBSan + valgrind 零泄漏、2–4h 长稳测试、
-  单元/集成/崩溃恢复三级测试。
+  `kill -9` 不丢数据；**AOF rewrite**（fork + COW 快照 + rewrite buffer 合流，rewrite 期间
+  并发写不丢）；**RDB 快照**（SAVE/BGSAVE）。
+- IO 抽象：可插拔 `IOEngine`（posix / **io_uring**），AOF 读写/fsync 走引擎接口。
+- 工程化：INFO 命令（内存/碎片率/命中率）、ASan/UBSan + **ThreadSanitizer** + valgrind
+  **零泄漏、零数据竞争**、长稳测试、崩溃恢复/rewrite/RDB 三级 demo 脚本。
 
 **一句话版本**：用 C++17 从零实现 Redis 子集，覆盖 Reactor 网络、无锁分片存储、渐进
-rehash、LRU 采样淘汰、AOF 崩溃恢复，压测 13 万 QPS、亚毫秒 P99。
+rehash、LRU 采样淘汰、AOF 崩溃恢复 + rewrite、RDB 快照、io_uring，压测 13 万 QPS、
+亚毫秒 P99，ASan/TSan/valgrind 全绿。
 
 ## 2. 项目难点与取舍
 
@@ -29,6 +33,11 @@ rehash、LRU 采样淘汰、AOF 崩溃恢复，压测 13 万 QPS、亚毫秒 P99
 | list 用 std::deque 会绕过内存统计 | 用 zmalloc 手写双向链表，让 used_memory 精确 |
 | AOF 多 shard 并发追加会交错 | 单 AofWriter + 互斥锁；always 持锁 fsync 是吞吐杀手，选 everysec |
 | INFO 跨线程统计 | 每 shard 原子计数 key/expire，避免跨线程加锁读 dict |
+| AOF rewrite 多线程 fork 后子进程 malloc 会死锁 | 子进程全程无分配（fork 前预分配 + `::write` + `_exit`），父进程用 rewrite buffer 接住 fork 后的写 |
+| AOF rewrite fork 瞬间读快照可能撕裂（rehash 半搬迁） | `SnapshotGate`（shared_mutex）：shard 任务持 shared，fork 前持 exclusive |
+| io_uring 单条 write+fsync 不更快 | 当前是同步 submit/wait 封装，先打通路径；真正收益在批提交 SQE，记录为未做 |
+| jemalloc 换 glibc malloc | 每线程 tcache 降争用、size class 降碎片，代价是 `used_memory` 按粗 size class 偏大、短期 RSS 略高 |
+| 多 key 命令跨 shard | scatter-gather（分组扇出 + countdown latch 汇总，不加锁）；代价是跨 shard 不保证原子，且 AOF 必须逐 shard 记日志（恢复按首 key 路由）|
 
 ## 3. 面试题与参考答案（要点）
 
@@ -51,8 +60,9 @@ everysec 后台线程每秒 fsync；no 不 fsync。`kill -9` 三种都不丢（�
 记录，截断修复。
 
 **Q5 Shard Worker**：key 按哈希路由到固定 worker，同一 key 的命令在单线程上 FIFO 执行，
-因此**存储无需加锁**；对 key 的并发访问天然串行化。代价是跨 shard 的多 key 命令（MGET）
-要协调多个 worker，本项目暂未实现。
+因此**存储无需加锁**；对 key 的并发访问天然串行化。跨 shard 的多 key 命令（MGET/MSET/DEL/
+EXISTS）用 **scatter-gather** 实现：按 shard 分组扇出 + countdown latch 汇总，但**跨 shard
+不保证原子**（MGET 拿不到一致快照、MSET 崩溃可能只应用部分 key）。
 
 **Q6 LRU 采样淘汰**：给对象记 lru 时间戳，淘汰时随机采样 N 个 key（`maxmemory_samples`），
 比较 lru 淘汰最旧。近似但 O(N) 可调，避免了精确 LRU 的全局链表 + 每次读写节点的开销。

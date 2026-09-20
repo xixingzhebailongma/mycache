@@ -14,6 +14,7 @@ namespace mycache {
 class AofWriter;
 struct Config;
 class CommandRouter;
+class PersistenceManager;
 
 // 命令处理器执行工作并发送回复所需的全部内容。db 指向命令所属 shard 的存储；
 // 无 key 的命令（PING/ECHO/INFO）在 IO 线程直接执行，db 为 nullptr。
@@ -23,6 +24,7 @@ struct CommandContext {
   AofWriter* aof = nullptr;       // 非空时写命令会追加到 AOF
   const Config* config = nullptr; // 无 key 命令（如 INFO）读取全局配置
   CommandRouter* router = nullptr; // 无 key 命令聚合各 shard 统计
+  PersistenceManager* pm = nullptr; // 持久化协调器（BGREWRITEAOF/SAVE/BGSAVE 用）
 
   void Reply(const RespValue& v) const { conn->Send(EncodeResp(v)); }
   void ReplySimple(const std::string& s) const { Reply(RespValue::Simple(s)); }

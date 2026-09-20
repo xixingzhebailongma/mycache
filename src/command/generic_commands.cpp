@@ -1,10 +1,13 @@
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "mycache/command/command.h"
 #include "mycache/command/command_context.h"
 #include "mycache/command/command_table.h"
+#include "mycache/command/multi_key.h"
 #include "mycache/common/time.h"
 #include "mycache/monitor/metrics.h"
 #include "mycache/persistence/aof/aof_format.h"
@@ -25,16 +28,33 @@ bool ParseIntArg(CommandContext& ctx, const RespValue& arg, long long* out) {
 }
 
 void ExistsCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
-  int count = 0;
-  for (size_t i = 1; i < args.size(); ++i) {
-    if (ctx.db->Exists(args[i].str)) {
-      ++count;
-      Metrics::Instance().IncrHits();
-    } else {
-      Metrics::Instance().IncrMisses();
-    }
-  }
-  ctx.ReplyInt(count);
+  auto keys = std::make_shared<std::vector<std::string>>();
+  keys->reserve(args.size() - 1);
+  for (size_t i = 1; i < args.size(); ++i) keys->push_back(args[i].str);
+
+  auto groups = GroupKeysByShard(*ctx.router, *keys);
+  auto total = std::make_shared<std::atomic<int64_t>>(0);
+  std::shared_ptr<Connection> conn = ctx.conn;
+
+  FanOut(ctx.router, groups,
+         [keys, total](Shard* shard, const KeyGroup& g) {
+           int n = 0;
+           // 重复 key 按 Redis 语义每个出现都计数（同一 key 必落在同一 shard，
+           // 逐 key 判断即可保留重复语义）。
+           for (size_t i : g.indices) {
+             if (shard->Exists((*keys)[i])) {
+               ++n;
+               Metrics::Instance().IncrHits();
+             } else {
+               Metrics::Instance().IncrMisses();
+             }
+           }
+           total->fetch_add(n, std::memory_order_relaxed);
+         },
+         [conn, total]() {
+           conn->Send(EncodeResp(
+               RespValue::Integer(total->load(std::memory_order_relaxed))));
+         });
 }
 
 void ExpireCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
@@ -71,7 +91,7 @@ void TtlCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
 }  // namespace
 
 void RegisterGenericCommands(CommandTable* table) {
-  table->Register(Command{"exists", -2, 1, ExistsCommand});
+  table->Register(Command{"exists", -2, 1, ExistsCommand, -1, 1});
   table->Register(Command{"expire", 3, 1, ExpireCommand});
   table->Register(Command{"pexpire", 3, 1, PExpireCommand});
   table->Register(Command{"ttl", 2, 1, TtlCommand});

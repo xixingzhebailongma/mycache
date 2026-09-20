@@ -74,6 +74,14 @@ class Shard {
   size_t Size() const;         // 当前 key 数（原子，跨线程安全）
   size_t ExpireCount() const;  // 带 TTL 的 key 数（原子，跨线程安全）
 
+  // ---- 快照遍历（无锁、无分配，供 fork 出的子进程做 AOF rewrite / RDB 快照）----
+  // 对 dict_ 中每个条目回调 visit(key, key_len, val, ttl_ms, ud)。val 为 Object*；
+  // ttl_ms 为绝对到期时间戳（UnixMs），无 TTL 时为 -1。仅只读，不推进 rehash、
+  // 不修改任何状态，因此可在 fork 出的子进程中安全遍历 COW 快照。
+  using SnapshotVisitor = void (*)(const char* key, size_t key_len,
+                                   const Object* val, int64_t ttl_ms, void* ud);
+  void ScanSnapshot(SnapshotVisitor visit, void* ud) const;
+
  private:
   bool DeleteKey(sds key);         // 从 dict_ 与 expires_ 同时删除；返回 key 是否存在
   bool ExpireIfNeeded(sds key);    // 惰性删除：已到期则删除并返回 true

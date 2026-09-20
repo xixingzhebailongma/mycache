@@ -86,13 +86,33 @@ Object* CreateIntObject(long long value) {
   return o;
 }
 
-Object* TryObjectEncoding(Object* o) {
+SharedObjects g_shared;
+
+void CreateSharedObjects() {
+  if (g_shared.integers[0] != nullptr) return;  // 幂等：只创建一次
+  for (int i = 0; i < kSharedIntegers; ++i) {
+    Object* o = CreateIntObject(i);
+    o->refcount = kSharedRefCount;  // 共享对象永驻
+    g_shared.integers[i] = o;
+  }
+}
+
+Object* TryObjectEncoding(Object* o, bool allow_shared) {
   if (!o->IsString() || o->encoding != ObjEncoding::kString) return o;
   sds s = static_cast<sds>(o->ptr);
   size_t len = sdslen(s);
   if (len <= 20) {  // long long 的十进制表示最多 20 字节
     long long value;
     if (StringToLongLong(s, len, &value)) {
+      // 共享整数（对齐 Redis shared.integers）：复用全局对象省内存，同时让 SET 覆盖
+      // 旧值时真正走到「新旧是同一对象」的引用计数路径。
+      if (allow_shared && value >= 0 && value < kSharedIntegers &&
+          g_shared.integers[value] != nullptr) {
+        Object* shared = g_shared.integers[value];
+        o->DecrRefCount();       // 释放临时 string 对象（含其 sds）
+        shared->IncrRefCount();  // 对共享对象是 no-op（refcount == INT_MAX）
+        return shared;
+      }
       // 释放独立 sds，原地改写为 int 编码。
       sdsfree(s);
       MemoryStats::Instance().DecrString(ObjEncoding::kString);

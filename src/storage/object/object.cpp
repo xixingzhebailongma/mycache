@@ -12,6 +12,7 @@
 namespace mycache {
 
 void Object::DecrRefCount() {
+  if (refcount == kSharedRefCount) return;  // 共享对象永驻，不递减、不释放
   if (--refcount > 0) return;
   switch (type) {
     case ObjType::kString:

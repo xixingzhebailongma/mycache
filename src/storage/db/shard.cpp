@@ -146,7 +146,7 @@ bool Shard::Get(const std::string& key, std::string* out) {
 
 void Shard::Set(const std::string& key, const std::string& value) {
   Object* o = CreateStringObject(value.data(), value.size());
-  o = TryObjectEncoding(o);
+  o = TryObjectEncoding(o, AllowSharedIntegers(eviction_));
   sds k = sdsnewlen(key.data(), key.size());
   if (expires_.Delete(k)) expire_count_.fetch_sub(1, std::memory_order_relaxed);  // SET 清除 TTL
   if (dict_.Replace(k, o) == 1) key_count_.fetch_add(1, std::memory_order_relaxed);
@@ -196,7 +196,7 @@ int Shard::HSet(const std::string& key, const std::string& field, const std::str
 
   Dict* hd = HashDict(o);
   Object* fv = CreateStringObject(value.data(), value.size());
-  fv = TryObjectEncoding(fv);
+  fv = TryObjectEncoding(fv, AllowSharedIntegers(eviction_));
   sds f = sdsnewlen(field.data(), field.size());
   int added = hd->Replace(f, fv);  // 1=新增字段，0=覆盖已有字段
   sdsfree(f);
@@ -472,6 +472,24 @@ size_t Shard::Size() const {
 
 size_t Shard::ExpireCount() const {
   return expire_count_.load(std::memory_order_relaxed);
+}
+
+void Shard::ScanSnapshot(SnapshotVisitor visit, void* ud) const {
+  // 遍历 dict_ 两张表（rehash 期间条目分散在两表，都要走一遍）。
+  for (int t = 0; t < 2; ++t) {
+    const HashTable& ht = dict_.Table(t);
+    if (!ht.table) continue;
+    for (size_t i = 0; i < ht.size; ++i) {
+      for (DictEntry* e = ht.table[i]; e; e = e->next) {
+        sds key = static_cast<sds>(e->key);
+        const Object* val = static_cast<const Object*>(e->val);
+        int64_t ttl_ms = -1;
+        DictEntry* te = expires_.Find(key);  // 只读，无分配，不推进 rehash
+        if (te) ttl_ms = static_cast<int64_t>(reinterpret_cast<intptr_t>(te->val));
+        visit(key, sdslen(key), val, ttl_ms, ud);
+      }
+    }
+  }
 }
 
 }  // namespace mycache

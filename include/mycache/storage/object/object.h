@@ -1,5 +1,6 @@
 #pragma once
 
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -16,6 +17,10 @@ inline void* LongLongToObjectPtr(long long v) {
   return reinterpret_cast<void*>(static_cast<intptr_t>(v));
 }
 
+// 共享对象（如共享整数 0..9999）的 refcount 钉在这个值上，永不递减、永不释放。
+// 与 Redis 的 OBJ_SHARED_REFCOUNT 一致。
+constexpr int kSharedRefCount = INT_MAX;
+
 // Redis 风格的引用计数对象（robj）。
 //
 // 对字符串对象（type == kString）支持两种编码：
@@ -31,7 +36,10 @@ struct Object {
   bool IsString() const { return type == ObjType::kString; }
   bool IsHash() const { return type == ObjType::kHash; }
   bool IsList() const { return type == ObjType::kList; }
-  void IncrRefCount() { ++refcount; }
+  void IncrRefCount() {
+    // 共享对象 refcount == INT_MAX，不再递增（避免有符号溢出），与 Redis incrRefCount 一致。
+    if (refcount < kSharedRefCount) ++refcount;
+  }
 
   // 引用计数减一；归零时释放整个对象（含独立分配的内部缓冲）。
   void DecrRefCount();

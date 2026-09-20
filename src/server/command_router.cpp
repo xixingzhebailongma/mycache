@@ -1,5 +1,6 @@
 #include "mycache/server/command_router.h"
 
+#include "mycache/persistence/snapshot_gate.h"
 #include "mycache/storage/dict/dict.h"
 
 namespace mycache {
@@ -26,7 +27,17 @@ size_t CommandRouter::ShardIndex(const std::string& key) const {
 }
 
 void CommandRouter::Route(const std::string& key, std::function<void(Shard*)> fn) {
-  shards_[ShardIndex(key)]->Submit(std::move(fn));
+  RouteTo(ShardIndex(key), std::move(fn));
+}
+
+void CommandRouter::RouteTo(size_t shard_index, std::function<void(Shard*)> fn) {
+  shards_[shard_index]->Submit([fn = std::move(fn)](Shard* shard) {
+    // 任务执行期间持快照闸门的 shared 锁，保证 fork 快照不会看到半修改的 shard。
+    auto& gate = GlobalSnapshotGate();
+    gate.LockShared();
+    fn(shard);
+    gate.UnlockShared();
+  });
 }
 
 }  // namespace mycache

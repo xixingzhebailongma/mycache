@@ -20,6 +20,11 @@ struct Command {
   // 该命令会在调用线程（IO 线程）直接执行而不路由到 shard。
   int first_key = 0;
   std::function<void(CommandContext&, const std::vector<RespValue>&)> handler;
+  // 多 key 命令：last_key < 0 表示 key 从 first_key 一直取到 args 末尾，>0 表示
+  // 最后一个 key 的下标；0 表示单 key/无 key 命令（沿用 first_key 语义）。
+  // key_step 为相邻 key 的下标差（MSET 的 key/value 交替，为 2）。
+  int last_key = 0;
+  int key_step = 1;
 };
 
 // 注册各阶段命令。

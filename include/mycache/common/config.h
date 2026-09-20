@@ -65,10 +65,22 @@ struct Config {
   std::string maxmemory_policy = "noeviction";  // noeviction/allkeys-lru/allkeys-random/volatile-lru/volatile-random
   int maxmemory_samples = 5;             // 每次淘汰时的采样数
 
+  // ---- RDB 持久化 (Week 6) ----
+  std::string dbfilename = "dump.rdb";   // SAVE/BGSAVE 快照文件名
+
+  // ---- IO 引擎 (Week 6) ----
+  std::string io_engine = "posix";       // posix / io_uring（后者需 liburing）
+
   // AOF 文件的完整路径（dir + appendfilename）。
   std::string AofPath() const {
     if (dir.empty() || dir == ".") return appendfilename;
     return dir + "/" + appendfilename;
+  }
+
+  // RDB 文件的完整路径（dir + dbfilename）。
+  std::string RdbPath() const {
+    if (dir.empty() || dir == ".") return dbfilename;
+    return dir + "/" + dbfilename;
   }
 
   bool Load(const std::string& path) {
@@ -103,6 +115,8 @@ struct Config {
     else if (key == "maxmemory") { int64_t v = 0; if (ParseMemorySize(value, &v)) maxmemory = v; }
     else if (key == "maxmemory_policy") maxmemory_policy = value;
     else if (key == "maxmemory_samples") maxmemory_samples = std::atoi(value.c_str());
+    else if (key == "dbfilename") dbfilename = value;
+    else if (key == "io_engine") io_engine = value;
   }
 };
 
