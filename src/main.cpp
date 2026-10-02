@@ -23,5 +23,6 @@ int main(int argc, char* argv[]) {
 
   mycache::Server server(config);
   server.Start();
+  mycache::Logger::Shutdown();
   return 0;
 }

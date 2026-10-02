@@ -6,6 +6,7 @@
 
 #include "mycache/net/buffer.h"
 #include "mycache/net/event_loop.h"
+#include "mycache/protocol/resp_parser.h"
 
 namespace mycache {
 
@@ -32,6 +33,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   const std::string& peer() const { return peer_; }
   Buffer* input() { return &input_; }
   Buffer* output() { return &output_; }
+  RespParser& parser() { return parser_; }
 
   void SetMessageCallback(MessageCallback cb) { message_cb_ = std::move(cb); }
   void SetCloseCallback(CloseCallback cb) { close_cb_ = std::move(cb); }
@@ -52,6 +54,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   std::unique_ptr<Channel> channel_;
   Buffer input_;
   Buffer output_;
+  RespParser parser_;  // 每连接一份，跨读续接（消除半包重扫）
 
   MessageCallback message_cb_;
   CloseCallback close_cb_;

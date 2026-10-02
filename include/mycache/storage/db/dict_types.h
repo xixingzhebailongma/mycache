@@ -7,7 +7,7 @@
 namespace mycache {
 
 // 共享的 dict 类型工厂：sds 键 + 不同种类的值。集中定义以避免在
-// Keyspace / Shard / hash 之间重复。
+// Shard / hash 之间重复。
 
 inline uint64_t SdsKeyHash(const void* key) {
   return DictHash(key, sdslen(static_cast<const char*>(key)));

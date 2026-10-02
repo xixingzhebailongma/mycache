@@ -12,11 +12,14 @@
 
 #include <gtest/gtest.h>
 
+#include "mycache/common/config.h"
 #include "mycache/common/time.h"
 #include "mycache/eviction/eviction_policy.h"
 #include "mycache/io/io_engine.h"
 #include "mycache/persistence/aof/aof_recovery.h"
 #include "mycache/persistence/aof/aof_rewrite.h"
+#include "mycache/persistence/aof/aof_writer.h"
+#include "mycache/persistence/persistence_manager.h"
 #include "mycache/persistence/rdb/rdb_loader.h"
 #include "mycache/persistence/rdb/rdb_writer.h"
 #include "mycache/server/command_router.h"
@@ -198,6 +201,57 @@ TEST(IoEngine, PosixWritePreadRoundTrip) {
   io->Close(fd);
 
   ::unlink(path.c_str());
+}
+
+// ---- 自动 AOF rewrite 触发（Week 6 收尾）----
+
+TEST(AutoRewrite, ShouldAutoRewriteBoundaries) {
+  // percentage <= 0：关闭自动 rewrite（含负值）。
+  EXPECT_FALSE(ShouldAutoRewrite(10 * 1024 * 1024, 1024, 64 * 1024 * 1024, 0));
+  EXPECT_FALSE(ShouldAutoRewrite(10 * 1024 * 1024, 1024, 64 * 1024 * 1024, -50));
+
+  // 未达到 min_size：不触发。
+  EXPECT_FALSE(ShouldAutoRewrite(1024, 1, 2048, 100));
+
+  // current <= base：未增长，不触发。
+  EXPECT_FALSE(ShouldAutoRewrite(1000, 1000, 1, 100));
+  EXPECT_FALSE(ShouldAutoRewrite(500, 1000, 1, 100));
+
+  // 增长不足 percentage：不触发。base=1000→current=1500 增长 50% < 100%。
+  EXPECT_FALSE(ShouldAutoRewrite(1500, 1000, 1, 100));
+
+  // 恰等于 percentage：触发。base=1000→current=2000 增长 100%。
+  EXPECT_TRUE(ShouldAutoRewrite(2000, 1000, 1, 100));
+
+  // base == 0：视为 1，任何 current>min 的增长都触发。
+  EXPECT_TRUE(ShouldAutoRewrite(100, 0, 1, 100));
+}
+
+TEST(AutoRewrite, MaybeAutoRewriteSilentlySkipsWithoutAof) {
+  PersistenceManager pm;  // 未 Init：aof_ 为空、aof_enabled_ 为 false
+  EXPECT_FALSE(pm.MaybeAutoRewrite());
+}
+
+TEST(AutoRewrite, MaybeAutoRewriteSkipsWhileRewriting) {
+  Config cfg;
+  cfg.appendonly = true;
+  cfg.appendfsync = "no";  // 不启动后台 flush 线程
+  std::string aof_path = "/tmp/mycache_auto_rewrite_" + std::to_string(::getpid()) + ".aof";
+  cfg.appendfilename = aof_path;  // dir 空 → AofPath() 直接返回绝对路径
+  ::unlink(aof_path.c_str());
+
+  EvictionConfig ev;
+  CommandRouter router(4, ev);
+  PersistenceManager pm;
+  ASSERT_TRUE(pm.Init(cfg, &router));
+
+  // 手动进入 rewrite 状态（rewriting_=true）：自动触发应静默跳过，不 fork。
+  pm.aof()->BeginRewrite();
+  EXPECT_FALSE(pm.MaybeAutoRewrite());
+  pm.aof()->AbortRewrite();
+
+  pm.Close();
+  ::unlink(aof_path.c_str());
 }
 
 }  // namespace mycache

@@ -9,6 +9,8 @@ class PosixIO : public IOEngine {
  public:
   int Open(const std::string& path, int flags, int mode) override;
   ssize_t Write(int fd, const void* buf, size_t len) override;
+  ssize_t Writev(int fd, const iovec* iov, int iovcnt) override;
+  ssize_t WritevFsync(int fd, const iovec* iov, int iovcnt) override;
   ssize_t Pread(int fd, void* buf, size_t len, off_t off) override;
   int Fsync(int fd) override;
   int Ftruncate(int fd, off_t len) override;

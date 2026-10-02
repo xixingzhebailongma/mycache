@@ -67,6 +67,12 @@ bool PersistenceManager::LoadRdbIfPresent(const Config& config, CommandRouter* r
 bool PersistenceManager::Init(const Config& config, CommandRouter* router) {
   router_ = router;
   rdb_path_ = config.RdbPath();
+  // ParseMemorySize 已拒绝负值；这里再防御性 clamp：负值按 0 处理，避免 static_cast 把
+  // 负数 wrap 成超大 uint64_t，令 ShouldAutoRewrite 的 current<=min_size 恒真、永不触发。
+  aof_rewrite_min_size_ = config.aof_rewrite_min_size > 0
+                              ? static_cast<uint64_t>(config.aof_rewrite_min_size)
+                              : 0;
+  aof_rewrite_percentage_ = config.aof_rewrite_percentage;
   io_ = CreateIOEngine(config.io_engine);
   if (config.appendonly) {
     aof_enabled_ = true;
@@ -80,11 +86,39 @@ void PersistenceManager::Close() {
   aof_.reset();
 }
 
+bool PersistenceManager::MaybeAutoRewrite() {
+  if (!aof_ || !aof_enabled_) return false;   // 无 AOF：静默跳过
+  if (HasChild()) return false;               // 已有子进程（rewrite/bgsave 进行中）
+  if (aof_->rewriting()) return false;        // 已在 rewrite
+
+  uint64_t current = aof_->current_size();
+  uint64_t base = aof_->base_size();
+  if (!ShouldAutoRewrite(current, base, aof_rewrite_min_size_, aof_rewrite_percentage_)) {
+    return false;
+  }
+
+  std::string err;
+  if (StartRewrite(&err)) {
+    LOG_INFO("auto AOF rewrite triggered (current %llu, base %llu)",
+             static_cast<unsigned long long>(current),
+             static_cast<unsigned long long>(base));
+    return true;
+  }
+  LOG_WARN("auto AOF rewrite failed to start: %s", err.c_str());
+  return false;
+}
+
 bool PersistenceManager::StartRewrite(std::string* err) {
   if (!aof_enabled_ || !aof_) {
     *err = "ERR AOF is not enabled";
     return false;
   }
+
+  // 子进程缓冲（锁外、fork 前预分配，避免子进程 malloc 死锁；分配失败无需回滚）。
+  std::vector<char> out_buf(kRewriteOutCap);
+  std::vector<char> rec_buf(kRewriteRecCap);
+
+  std::lock_guard<std::mutex> lock(child_mu_);   // 检查 + fork 同一临界区，消除 TOCTOU
   if (child_pid_ > 0) {
     *err = "ERR background save/rewrite already in progress";
     return false;
@@ -94,9 +128,6 @@ bool PersistenceManager::StartRewrite(std::string* err) {
     return false;
   }
 
-  // 子进程缓冲（fork 前分配，避免子进程 malloc 死锁）。
-  std::vector<char> out_buf(kRewriteOutCap);
-  std::vector<char> rec_buf(kRewriteRecCap);
   child_tmp_path_ = aof_path_ + ".rewrite.tmp";
 
   // 快照闸门：排空所有在途 shard 任务后 fork，保证 COW 快照一致；随后 BeginRewrite
@@ -116,7 +147,7 @@ bool PersistenceManager::StartRewrite(std::string* err) {
   gate.UnlockExclusive();
 
   if (pid < 0) {
-    aof_->AbortRewrite();
+    aof_->AbortRewrite();   // 回滚 rewriting_ 与 base_size_
     *err = "ERR fork failed";
     return false;
   }
@@ -128,6 +159,7 @@ bool PersistenceManager::StartRewrite(std::string* err) {
 }
 
 bool PersistenceManager::Save(std::string* err) {
+  std::lock_guard<std::mutex> lock(child_mu_);
   if (child_pid_ > 0) {
     *err = "ERR background save/rewrite already in progress";
     return false;
@@ -158,7 +190,40 @@ bool PersistenceManager::Save(std::string* err) {
   return true;
 }
 
+bool PersistenceManager::Load(std::string* err) {
+  if (aof_enabled_) {
+    *err = "ERR LOAD is not supported when appendonly is enabled (AOF would desync)";
+    return false;
+  }
+  if (::access(rdb_path_.c_str(), F_OK) != 0) {
+    *err = "ERR no RDB file to load (run SAVE/BGSAVE first)";
+    return false;
+  }
+
+  RdbLoadResult r;
+  {
+    // RAII 独占锁：排空在途命令 + 定时器任务；即使 FlushAll/RdbLoad 抛异常
+    // （如 std::bad_alloc），unique_lock 析构也会自动解锁，不会死锁。
+    // RdbLoad 必须在独占锁内、单线程调用：其内部用 router->ShardAt() 直接写 shard，
+    // 不访问 worker 队列，也不依赖任何 worker 线程路径。
+    auto gate_lock = GlobalSnapshotGate().ExclusiveLock();
+    for (size_t i = 0; i < router_->shard_count(); ++i) {
+      router_->ShardAt(i)->FlushAll();
+    }
+    r = RdbLoad(rdb_path_, router_);
+  }  // 离开作用域，gate_lock 析构自动 UnlockExclusive
+
+  if (!r.ok) {
+    *err = "ERR LOAD failed: " + r.error + " (database was flushed)";
+    return false;
+  }
+  LOG_INFO("LOAD: reloaded %llu key(s) from %s",
+           static_cast<unsigned long long>(r.keys_loaded), rdb_path_.c_str());
+  return true;
+}
+
 bool PersistenceManager::BgSave(std::string* err) {
+  std::lock_guard<std::mutex> lock(child_mu_);
   if (child_pid_ > 0) {
     *err = "ERR background save/rewrite already in progress";
     return false;
@@ -201,6 +266,7 @@ void PersistenceManager::FinishBgSave(bool ok) {
 }
 
 void PersistenceManager::OnChildExit(pid_t pid, int status) {
+  std::lock_guard<std::mutex> lock(child_mu_);
   if (pid != child_pid_) return;
   int kind = child_kind_;
   child_pid_ = -1;

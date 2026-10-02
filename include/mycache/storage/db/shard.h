@@ -74,6 +74,15 @@ class Shard {
   size_t Size() const;         // 当前 key 数（原子，跨线程安全）
   size_t ExpireCount() const;  // 带 TTL 的 key 数（原子，跨线程安全）
 
+  // 清空本 shard 全部 key（含 TTL），供运行时 LOAD 重载前的整库清空。
+  // 必须在持有 GlobalSnapshotGate 独占锁时调用（无并发 worker 访问）。
+  // 注意：Dict::Clear() 只释放条目并复位 ht/rehashidx，【不会】动 key_count_/expire_count_
+  // 这两个 Shard 手动维护的原子计数；因此这里必须手动 store(0)，否则 Size()/ExpireCount()
+  // 残留旧值。清空后 dict 处于可立即写入状态（Clear 已复位 rehashidx 与两表）。
+  // 跨 shard 不保证原子：依赖 Dict::Clear() 不抛异常；若某 shard 的 FlushAll 中途抛异常，
+  // 会留下「部分 shard 已清空、部分还是旧数据」的中间态——这是 DEBUG RELOAD 风格的取舍。
+  void FlushAll();
+
   // ---- 快照遍历（无锁、无分配，供 fork 出的子进程做 AOF rewrite / RDB 快照）----
   // 对 dict_ 中每个条目回调 visit(key, key_len, val, ttl_ms, ud)。val 为 Object*；
   // ttl_ms 为绝对到期时间戳（UnixMs），无 TTL 时为 -1。仅只读，不推进 rehash、

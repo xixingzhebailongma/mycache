@@ -55,9 +55,9 @@ std::string EncodeRecord(const std::string& payload) {
   return out;
 }
 
-void LogCommand(AofWriter* aof, const std::string& name, const std::vector<std::string>& args) {
-  if (aof == nullptr) return;
-  aof->Append(EncodeRecord(EncodeCommand(name, args)));
+int LogCommand(AofWriter* aof, const std::string& name, const std::vector<std::string>& args) {
+  if (aof == nullptr) return 0;  // 无 AOF：日志关闭不算错误
+  return aof->Append(EncodeRecord(EncodeCommand(name, args)));
 }
 
 }  // namespace aof

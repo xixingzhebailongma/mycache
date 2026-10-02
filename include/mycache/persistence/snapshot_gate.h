@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <shared_mutex>
 
 namespace mycache {
@@ -19,6 +20,12 @@ class SnapshotGate {
   void UnlockShared() { mu_.unlock_shared(); }
   void LockExclusive() { mu_.lock(); }
   void UnlockExclusive() { mu_.unlock(); }
+
+  // RAII 守卫（异常安全）：返回持独占锁的 unique_lock，作用域结束（含异常栈展开）自动解锁。
+  // Load() 这类长临界区用它替代裸 Lock/Unlock，避免 FlushAll/RdbLoad 抛异常时漏解锁死锁。
+  std::unique_lock<std::shared_mutex> ExclusiveLock() {
+    return std::unique_lock<std::shared_mutex>(mu_);
+  }
 
  private:
   std::shared_mutex mu_;

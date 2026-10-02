@@ -81,3 +81,30 @@ TEST(RouterTest, RouteRoundTrip) {
 
   router.Stop();
 }
+
+TEST(ShardTest, FlushAllClearsAndWritable) {
+  CommandRouter router(1, mycache::EvictionConfig{});
+  Shard* s = router.ShardAt(0);
+
+  s->Set("a", "value1");
+  s->Set("b", "value2");
+  s->HSet("h", "f", "v");
+  s->ExpireAt("b", 1234567890LL);
+  EXPECT_EQ(s->Size(), 3u);
+  EXPECT_EQ(s->ExpireCount(), 1u);
+
+  s->FlushAll();
+
+  EXPECT_EQ(s->Size(), 0u);
+  EXPECT_EQ(s->ExpireCount(), 0u);
+  std::string out;
+  EXPECT_FALSE(s->Get("a", &out));   // string key 清空后 miss
+  EXPECT_FALSE(s->Get("h", &out));   // hash key 清空后 miss（已不存在，不会走 ToString）
+
+  // 清空后可立即写入：确认 Dict::Clear() 之后 dict 仍处于可写入状态（评审点 2）。
+  s->Set("c", "new");
+  EXPECT_TRUE(s->Get("c", &out));
+  EXPECT_EQ(out, "new");
+  EXPECT_EQ(s->Size(), 1u);
+  EXPECT_EQ(s->ExpireCount(), 0u);
+}

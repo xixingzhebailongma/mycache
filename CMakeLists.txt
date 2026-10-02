@@ -86,9 +86,6 @@ endif()
 # ---- 基准测试客户端 ----
 if(MYCACHE_BUILD_BENCH)
   add_executable(mycache_bench benchmark/pipeline_test.cpp)
-  # 百万级 key 内存引擎压测（绕过网络，直接驱动 Keyspace）。
-  add_executable(mycache_stress benchmark/million_keys.cpp)
-  target_link_libraries(mycache_stress PRIVATE mycache_core)
   # AOF 三种 fsync 策略压测（绕过网络，直接驱动 AofWriter）。
   add_executable(mycache_aof_bench benchmark/aof_bench.cpp)
   target_link_libraries(mycache_aof_bench PRIVATE mycache_core)

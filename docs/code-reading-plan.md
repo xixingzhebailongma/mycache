@@ -1,12 +1,44 @@
 # mycache 全项目代码阅读方案
 
-本文是一份**贯穿 Week1–6 的阅读地图**：把 ~50 个源文件按依赖顺序排好，逐文件给出「需要
+本文是一份**贯穿 Week1–8 的阅读地图**：把 ~50 个源文件按依赖顺序排好，逐文件给出「需要
 知道的点」，并明确标出哪些文件是**脚手架/未接入的死文件**（可以直接跳过）。
 
 - 已有单周深度复盘的，本文只给一句话 + 链接，不重复：`code-reading-week4.md`（AOF）、
   `code-reading-week5.md`（淘汰/监控/list）、`code-reading-week6.md`（AOF rewrite/RDB/io_uring）。
 - 高层「是什么/为什么」看 `architecture.md`；本文讲「代码在哪、按什么顺序读、每段要懂什么」。
-- 建议配合 `./build/mycache_tests`（78 个单测）一起看：读完一个模块就点开对应的 `tests/unit/*_test.cpp` 验证理解。
+- 建议配合 `./build/mycache_tests`（15 个单测文件 / 95 个 `TEST()` 用例）一起看：读完一个模块就点开对应的 `tests/unit/*_test.cpp` 验证理解。
+
+---
+
+## 0. 面试速查地图（冲刺用）
+
+> 时间紧时只读这张表：左→右是「考点 → 读哪里 → 面试题库」。读完一行，立刻去
+> `interview-answer-key.md` 用对应题**口头自测一遍**。逐题答案要点都在题库里，这里只给「去哪读」。
+>
+> 题号记法：`R1-Q1` = 题库「第 1 轮 Q1」，`R5-BQ1` = 「第 5 轮 BQ1」，`W6/7-Q3` = 「Week 6/7 专题 Q3」。
+
+| # | 高频考点 | 读哪里（Phase / 文件） | 题库题号 |
+|---|---|---|---|
+| 1 | `SET foo bar` 完整链路（accept → 路由 → 无锁写 → 回包） | Phase 7→8→9 | R1-Q1 |
+| 2 | 无锁路由为何成立 / 路由改坏的后果 | Phase 9 | R1-Q2 |
+| 3 | 渐进式 rehash，读路径为何后来也推进 | Phase 3 | R1-Q3 |
+| 4 | `SET foo 100` 的 int 编码内存布局 | Phase 2 | R1-Q4 |
+| 5 | 惰性删除 + 主动过期为何两个都要 | Phase 4 | R2-Q1 |
+| 6 | AOF 三种 fsync 到底差在哪 | Phase 10 | R2-Q2 |
+| 7 | 近似 LRU vs 精确 LRU | Phase 6 | R2-Q3 |
+| 8 | 「按 shard 均分」如何化简成全局水位 | Phase 6 | R2-Q4 |
+| 9 | 多 key scatter-gather，为何不保证原子 | Phase 8 | R3-Q1 |
+| 10 | INCR 记成 SET、EXPIRE 记成 PEXPIREAT | Phase 8 | R3-Q2 |
+| 11 | **io_uring 只碰文件 I/O，不碰网络** | Phase 10（io_engine） | W6/7-Q3 |
+| 12 | fork+COW 的 AOF rewrite 三难点 | Phase 10（aof_rewrite） | W6/7-Q1 |
+| 13 | jemalloc 零改动替换 + 代价 | Phase 10（Week7 段） | W6/7-Q5 |
+| 14 | ET vs LT、shared_from_this vs tie | Phase 7 | R4-Q1/Q2 |
+| 15 | sds 为什么自研、`s[-1]` 怎么定位 | Phase 2 | R4-Q5 |
+| 16 | 行为面：最难 bug / 重来一次改什么 | 全文读完后 | R5-BQ1/BQ2 |
+
+> 标注 **加粗** 的是最容易答错/被戳穿的点——尤其第 11 条：本项目的 `io_engine`（posix/io_uring）
+> **只用于持久化文件 I/O**（AOF/RDB 的 `write`/`fsync`），网络收发**始终是 epoll**，io_uring 完全不碰
+> socket。把二者混为一谈会直接暴露「没读透」。
 
 ---
 
@@ -36,6 +68,13 @@
 两个独立的线程体系：**IO 线程**管网络与协议，**ShardWorker 线程**管数据。它们之间靠
 `EventLoop::RunInLoop`（把任务/回复排队到对方线程）来交接，靠 `Connection::shared_from_this`
 保证交接期间连接不被析构。
+
+⚠️ 一个高频误解：项目里的 `io_engine`（posix/io_uring）**只用于持久化文件 I/O**（AOF/RDB 的
+`write`/`fsync`，见 Phase 10），**网络收发始终是 epoll**，io_uring 完全不碰 socket——上面整张图
+从 accept 到 conn 读写没有任何 io_uring 参与。
+
+Week 8 在多 key 命令上又加了一层「扇出」：`DEL/EXISTS/MGET/MSET` 会按 key 哈希分发到多个 shard
+再汇总（见 Phase 8 的 `multi_key.cpp`），所以「有 key 就只落一个 shard」只对单 key 命令成立。
 
 ---
 
@@ -108,17 +147,18 @@
 | `net/acceptor.h` + `.cpp` | 监听套接字 + accept 至 EAGAIN |
 | `net/reactor.h` + `.cpp` | `IOReactor`：线程 + EventLoop + 连接表 |
 
-### Phase 8 命令层
+### Phase 8 命令层（30 个命令）
 | 文件 | 作用 |
 |------|------|
-| `command/command.h` | `Command` 元数据（name/arity/first_key/handler） |
+| `command/command.h` | `Command` 元数据（name/arity/first_key/last_key/key_step/handler） |
 | `command/command_context.h` | `CommandContext` + `EvictOrOom` |
 | `command/command_table.h` + `.cpp` | 注册 / 查找 / arity 校验 |
-| `command/string_commands.cpp` | PING/SET/GET/DEL/ECHO/INCR/DECR/INCRBY/DECRBY |
-| `command/generic_commands.cpp` | EXISTS/EXPIRE/PEXPIRE/TTL |
+| `command/string_commands.cpp` | PING/SET/GET/ECHO/INCR/DECR/INCRBY/DECRBY + 注册 DEL/MGET/MSET（多 key） |
+| `command/generic_commands.cpp` | EXPIRE/PEXPIRE/TTL + 注册 EXISTS（多 key） |
 | `command/hash_commands.cpp` | HSET/HGET/HDEL/HGETALL |
 | `command/list_commands.cpp` | LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN |
-| `command/server_commands.cpp` | INFO/DBSIZE（无 key，IO 线程执行） |
+| `command/server_commands.cpp` | INFO/DBSIZE/SAVE/BGSAVE/BGREWRITEAOF（无 key，IO 线程执行） |
+| `command/multi_key.cpp` | DEL/EXISTS/MGET/MSET 的跨 shard 扇出与汇总（`GroupKeysByShard`/`FanOut`） |
 
 ### Phase 9 服务器装配（串起整条链路）
 | 文件 | 作用 |
@@ -127,12 +167,17 @@
 | `server/shard_worker.h` + `.cpp` | 每 shard 一线程 + timerfd 周期任务 |
 | `server/server.h` + `.cpp` | ★装配：`Start`/`InitAof`/`OnMessage`/`DispatchCommand`/`Stop` |
 
-### Phase 10 持久化（复用 Week4/Week6 深挖，此处只链接）
+### Phase 10 持久化（Week4 AOF + Week6 rewrite/RDB/IOEngine + Week7 jemalloc）
 | 文件 | 作用 |
 |------|------|
 | `persistence/aof/aof_format.h` + `.cpp` | 记录格式：magic + `[len][crc32][RESP]` |
 | `persistence/aof/aof_writer.h` + `.cpp` | 三种 fsync 策略 + 后台线程 |
 | `persistence/aof/aof_recovery.h` + `.cpp` | 启动时重放 + 尾部修复 |
+| `persistence/aof/aof_rewrite.h` + `.cpp` | fork + COW 紧凑基线（Week6） |
+| `persistence/rdb/rdb_writer` + `rdb_loader` | 二进制快照 SAVE/BGSAVE（Week6） |
+| `io/io_engine` + `posix_io`/`uring_io` | 可切换文件 I/O（Week6，**不碰网络**） |
+| `persistence/snapshot_gate.h` | fork 前快照闸门（Week6） |
+| `persistence/persistence_manager` | 编排 AOF/RDB + SIGCHLD（Week6） |
 
 ### Phase 11 测试（按子系统对照）
 | 测试 | 对应 Phase |
@@ -142,6 +187,8 @@
 | `tests/unit/hash_test.cpp` / `ttl_test.cpp` / `router_test.cpp` | 4–5 |
 | `tests/unit/lru_test.cpp` / `eviction_test.cpp` / `list_test.cpp` / `info_test.cpp` | 5–6 |
 | `tests/unit/aof_test.cpp` | 10 |
+| `tests/unit/week6_test.cpp` | 10（rewrite/RDB/io_engine） |
+| `tests/unit/multi_key_test.cpp` | 8（多 key 扇出） |
 | `tests/integration/*` / `tests/stress/*` / `benchmark/*` | 端到端 / 压力 / 直驱引擎 |
 
 ---
@@ -446,6 +493,9 @@
 **需要知道的点**：
 1. `arity` 语义（`command.h:16`）：正值 = 参数个数**恰好**等于（含命令名）；负值 = **至少** `|arity|` 个。所以 `set` 是 `3`（SET k v 恰好 3 个），`del` 是 `-2`（至少 2 个）。
 2. `first_key` 是路由 key 在 args 里的下标，`0` = 无 key（IO 线程直接执行）。这是「有 key 走 shard、无 key 就地跑」的开关。
+3. **多 key 元数据（Week 8 加的）**：`last_key`（<0 取到末尾、>0 显式末下标、0 单/无 key）与
+   `key_step`（MSET 的 key/value 交替为 2）。有了它们，`DEL/EXISTS/MGET/MSET` 才能被识别为多 key
+   命令并走 `multi_key.cpp` 的扇出（见下面的 `multi_key.cpp` 段，对齐 R3-Q1）。
 
 #### `command/command_context.h`
 **作用**：`CommandContext`——handler 执行时能拿到的所有东西 + 回复辅助 + `EvictOrOom`。
@@ -487,11 +537,20 @@
 3. `LPop/RPop` 是**破坏性写**，记成 `LPOP/RPOP`（重放时逐次弹出，效果一致）；`LPush/RPush` 记成**参数一致**的 `LPUSH/RPUSH`（重放按同顺序重建列表）。
 
 #### `command/server_commands.cpp`
-**作用**：INFO / DBSIZE（都是无 key，IO 线程执行）。
+**作用**：INFO / DBSIZE / SAVE / BGSAVE / BGREWRITEAOF（都是无 key，IO 线程执行）。
 
 **需要知道的点**：
 1. `InfoCommand`/`DbSizeCommand` 依赖 `ctx.config`/`ctx.router`（IO 线程直接注入，见 `server.cpp:253`）——所以它们能聚合**全部** shard，不绑定某个 shard。
 2. 无 key 命令 `db == nullptr`，handler 里绝不能碰 `ctx.db`。
+3. `SAVE`/`BGSAVE`/`BGREWRITEAOF` 转发到 `ctx.pm`（`PersistenceManager`），真正的逻辑在 Phase 10。
+
+#### `command/multi_key.cpp`（Week 8 多 key scatter-gather）
+**作用**：`DEL/EXISTS/MGET/MSET` 跨 shard 扇出与汇总的实现（命令在 `string_commands.cpp`/`generic_commands.cpp` 注册，handler 在这里）。
+
+**需要知道的点**：
+1. `GroupKeysByShard`（`multi_key.cpp:10`）：按 `DictHash(key)%N` 把 key 下标分桶，**保留下标**——`MGET` 回填靠下标、不靠完成顺序。
+2. `FanOut`（`:45`）：把每个 shard 的子命令派发到对应线程，用**原子 countdown latch**（`remaining` 计数 + `fetch_sub`，`acq_rel`）扇入，最后完成的线程负责汇总回包——**不加锁**，各 shard 写自己那格。
+3. **跨 shard 不保证原子**：各 shard 在不同线程、略微不同时刻执行，`MGET` 拿不到一致快照、`MSET` 崩溃可能只应用部分 key。要一致就得退回单线程或加跨 shard 锁。完整取舍看 R3-Q1。
 
 ### 3.9 服务器装配
 
@@ -519,16 +578,36 @@
 3. `DispatchCommand`（`:209`）：小写命令名 → 查表 → arity 校验 → `IncrCommands` → 按 `first_key` 决定**路由到 shard**（带 aof/config/router 进 context）还是 **IO 线程直接执行**（`db=nullptr`）。
 4. `Stop`（`:120`）优雅关闭：停 acceptor → 停 IO reactor → 停 shard worker → 关 AOF（flush+fsync）→ quit 主循环。顺序反过来拆。
 
-### 3.10 持久化（详见 `code-reading-week4.md` / `code-reading-week6.md`）
+### 3.10 持久化（Week4 AOF + Week6 rewrite/RDB/IOEngine + Week7 jemalloc）
 
-`aof_format`（记录格式 `[len][crc32][RESP]`）→ `aof_writer`（三种 fsync 策略 + 后台线程）→
-`aof_recovery`（启动重放 + 三条损坏判断 + 尾部截断）。这一整块 Week4 已经逐段讲过，读代码时
-配合 `code-reading-week4.md` 第 4 节的逐段讲解和第 5 节自查题即可，这里不重复。
+**Week4 AOF**：`aof_format`（记录格式 `[len][crc32][RESP]`）→ `aof_writer`（三种 fsync 策略 +
+后台线程）→ `aof_recovery`（启动重放 + 三条损坏判断 + 尾部截断）。逐段讲解与自查题见
+`code-reading-week4.md`，这里不重复。
 
-Week6 在之上新增 rewrite / RDB / IOEngine：`aof_rewrite`（fork + COW 无分配子进程）、
-`rdb_writer/rdb_loader`（二进制快照）、`io_engine` + `posix_io`/`uring_io`（可切换 I/O）、
-`snapshot_gate`（fork 前的快照闸门）、`persistence_manager`（协调 fork/SIGCHLD/收尾）。逐段
-讲解与自查题见 `code-reading-week6.md`。
+**Week6/7 新增**（逐文件要点，配套 `code-reading-week6.md` 逐段讲解）：
+
+- **`io/io_engine.h` + `io/io_engine.cpp`**：`IOEngine` 抽象接口（Open/Write/Pread/Fsync/
+  Ftruncate/Close），`CreateIOEngine` 按 `config.io_engine` 选 `UringIO` 或 `PosixIO`。
+  **边界（面试高频陷阱）**：这个引擎**只服务持久化文件 I/O**（由 `PersistenceManager::Init` 创建、
+  注入 `AofWriter`），网络收发**从不经过它**——网络永远是 epoll（Phase 7）。别把 io_uring 当成
+  「加速 socket」的东西。
+- **`io/posix_io.h/.cpp`**：libc `open/write/pread/fsync/ftruncate/close` 的直封装，`Write`/`Pread`
+  循环处理 `EINTR` 和部分读写。
+- **`io/uring_io.h/.cpp`**：liburing 封装。**只有 `Write` 和 `Fsync` 走 io_uring**，且是「同步
+  submit 一个 SQE + `wait_cqe` 等完成」——一条条来，`Open/Pread/Ftruncate/Close` 委托内部的
+  `PosixIO`。真正的收益在**批提交多个 SQE**（本项目未做，属要主动承认的「已完成 vs 未完成」）。
+- **`aof_rewrite`**：fork + COW 子进程写紧凑基线。三个难点：① fork 后子进程只剩调用线程 → 全程
+  **无分配**（预分配 buffer + `::write`/`::fsync` + `_exit`）；② rewrite buffer 接住 fork 后的并发
+  写；③ `SnapshotGate` 保证 fork 瞬间没有半途的 shard 任务。详见 `code-reading-week6.md`。
+- **`rdb_writer`/`rdb_loader`**：二进制快照（`MYRDB001` magic + 逐 key `[len][crc][payload]`），
+  `SAVE` 阻塞写 / `BGSAVE` fork 写，都写 temp 再原子 rename。启动加载 AOF 优先。
+- **`snapshot_gate.h`**：`shared_mutex`——shard 命令/定时器持 shared 锁，fork 前持 exclusive 锁，
+  保证子进程读不到「rehash 搬一半」的撕碎 dict。
+- **`persistence_manager`**：编排 AOF/RDB + SIGCHLD 收尾；`Init` 里 `CreateIOEngine`（
+  `persistence_manager.cpp:70`）是 io_uring 唯一的消费点。
+- **jemalloc（Week7）**：`zmalloc` 只包 `malloc/free/malloc_usable_size`，链接 jemalloc 后符号被
+  透明拦截、**引擎零改动**；收益是每线程 tcache 减 arena 争用（QPS +2~3%），代价是 `used_memory`
+  偏大。详见 `architecture.md` 第 7 周段。
 
 ---
 
@@ -572,3 +651,46 @@ Week6 在之上新增 rewrite / RDB / IOEngine：`aof_rewrite`（fork + COW 无�
 
 读完这 11 个 Phase，你就能说出「一个 key 从网络字节到落盘，中间经过了哪些线程、哪些结构、
 哪些取舍」，这也就是整个项目想让你学到的东西。
+
+---
+
+## 6. 面试自查题 + 与题库联动
+
+### 6.1 Phase ↔ 题库 双向映射
+
+正向（按阅读顺序读完后，你应该能答的题）：
+
+| Phase | 读完应能答 | 题库 |
+|---|---|---|
+| 0 入口/配置 | 两套时钟（单调钟 vs 墙钟）分别干什么 | —（基础，支撑 R2-Q1） |
+| 1 协议 | 半包怎么处理（`kIncomplete` 三态） | —（支撑 R1-Q1） |
+| 2 存储基础 | int 编码布局、sds 为什么自研 | R1-Q4、R4-Q5 |
+| 3 字典 | 渐进 rehash、读路径为何后来也推进 | R1-Q3 |
+| 4 分片 | 惰性/主动过期、SET 清 TTL | R2-Q1 |
+| 5 集合 | hash placement new、list 不用 deque | R3-Q4 |
+| 6 淘汰/监控 | 近似 LRU、全局水位化简、碎片率 | R2-Q3/Q4 |
+| 7 网络 | ET/LT、RunInLoop、tie vs shared_from_this | R4-Q1/Q2 |
+| 8 命令 | 30 命令、多 key 扇出、INCR→SET | R3-Q1/Q2 |
+| 9 装配 | 路由、启动顺序、跨线程回包 | R1-Q1/Q2、R4-Q3 |
+| 10 持久化 | 三 fsync、rewrite、RDB、io_uring 边界 | R2-Q2、W6/7-Q1/Q2/Q3 |
+| 11 测试 | 每个单测在验证什么不变量 | — |
+
+反向（从题库定位到代码）：每题在 §0 速查表已给出对应 Phase；`interview-answer-key.md` 每题答案要点
+里提到的文件/行号可直接回本文对应节核对。
+
+> 首测诊断显示你的弱项是**第 2、3、5 轮**（「为什么这么选 + 代价」这一层，2.5~2.6/10）。
+> 优先把 **Phase 6 / 8 / 10** 的「为什么 + 代价」练到能口头说，而不是只背名词。
+
+### 6.2 每 Phase 自查题（读完立刻口头答，答不出就回看对应文件）
+
+> 每题答案要点都在 `interview-answer-key.md`，先自己答再看，比对缺了哪句。
+
+- **Phase 2**：`SET foo 100` 在内存里是几个对象？value 是 int 还是 string 编码、为什么？（R1-Q4）
+- **Phase 3**：rehash 触发条件是什么？读路径为什么不推进、后来为什么又推进？（R1-Q3）
+- **Phase 4**：为什么惰性删除不够、必须配主动过期？`SET` 覆盖带 TTL 的 key 要做什么？（R2-Q1）
+- **Phase 6**：为什么近似 LRU 而非精确 LRU？`maxmemory_samples=1` 会怎样？（R2-Q3）
+- **Phase 7**：ET 下读不干净会怎样——饿死还是「数据不完整」？（R4-Q1）
+- **Phase 8**：`MGET` 跨 shard 为什么拿不到一致快照？要一致得付什么代价？（R3-Q1）
+- **Phase 10**：io_uring 在本项目里碰网络吗？三种 fsync 哪个会塌到 ~180 ops/s、为什么？（W6/7-Q3、R2-Q2）
+
+完整 5 轮 + Week6/7 题库逐题见 `interview-answer-key.md`。

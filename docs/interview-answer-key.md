@@ -249,6 +249,7 @@ syscall）；io_uring 是「**完成**通知」（把要读写的 buffer+位置�
 syscall + 上下文切换。本项目当前是「同步 submit + 等待完成」的封装（先打通路径），单条
 write+fsync 实测 posix 186 vs io_uring 191 ops/s 基本持平——**真正的收益在批提交多个 SQE（未
 实现）**，这正是要主动承认的「已完成 vs 未完成」边界。
+→ 详见下方『批提交/组提交/批 fsync/writev 的辨析』
 
 ### Q4. LFU 和 LRU 的区别？为什么先做 LRU？
 
@@ -267,6 +268,83 @@ LFU 用计数区分「偶发一次」和「长期高频」。LFU 适合热点稳
 是 jemalloc 的 `malloc_usable_size` 按更粗 size class 上取整，`used_memory` 偏大、短期 RSS 略
 高（用内存换低碎片 + 高并发，Redis 也接受）。
 
+## 批提交 / 组提交 / 批 fsync / writev 的辨析
+
+> 承接上文 io_uring 的 Q3。四个词都被叫过「批」，但解决的是不同层的开销，面试里混用会翻车。
+> 本节把它们对齐到代码位置和收益来源。
+
+### 1. 四个词各是什么、解决哪层开销
+
+- **批提交（batch submit）**：io_uring 的**提交层**。攒多条 SQE，一次 `io_uring_enter`
+  提交、之后一次收割多条 CQE。省的是「每条 submit + wait_cqe」的系统调用往返。**io_uring 专属**。
+- **组提交（group commit）**：AOF 的**持久性层**。攒一批记录做**一次 fsync**，fsync 完成后
+  **批量 ack** 这批客户端。省的是「每条记录一次 fsync」的磁盘延迟（摊销）。**不依赖 io_uring**，
+  纯 posix 也能做。
+- **批 fsync（batched fsync）**：把「逐条 fsync」降为「定时/定量 fsync 一次」。组提交 =
+  批 fsync + 批量 ack；everysec 档已经在做最粗糙的批 fsync（后台线程一秒 fsync 一次），但
+  **没有批量 ack**。
+- **writev（payload 批）**：把 N 条记录塞进 iovec 数组、一次 `write` 系统调用。省的是
+  「write syscall 次数」。**POSIX 原语，不依赖 io_uring**。
+
+一句话区分：**writev 批的是「数据」，批提交批的是「提交动作」，组提交批的是「fsync + ack」，
+批 fsync 只是组提交的一半。**
+
+### 2. 一张表
+
+| 层 | 位置 | 现状 | 收益来源 | 依赖 io_uring |
+|---|---|---|---|---|
+| 批提交 | `src/io/uring_io.cpp` | ❌ 同步 submit+wait，1 SQE 一次 submit | 省 submit/wait syscall 往返 | ✅ 是 |
+| 组提交 | `src/persistence/aof/aof_writer.cpp` | ❌ always 每条 fsync，无批量 ack | 摊薄 fsync 延迟 | ❌ 否 |
+| 批 fsync | `src/persistence/aof/aof_writer.cpp` FlushLoop | 🟡 everysec 一秒 fsync 一次 | 摊薄 fsync 次数 | ❌ 否 |
+| writev | `src/persistence/aof/aof_writer.cpp` Append/WriteAll | ❌ 逐条 `io_->Write` | 省 write syscall 次数 | ❌ 否 |
+| 回包 flush | `src/net/connection.cpp` Send/HandleWrite | ✅ output 缓冲，写就绪一次刷 | 省写就绪往返 / TCP 小包 | ❌ 否 |
+| pipeline | `src/server/server.cpp` OnMessage | ✅ 一包多条逐条 Parse 执行 | 省 RTT（不省执行） | ❌ 否 |
+
+注：回包 flush、pipeline 是网络/协议层的「批」，和持久化无关，列进来是为不散着；它们
+**既不是** io_uring 批提交、**也不是**组提交。pipeline 省的是 RTT，回包 flush 省的是写就绪
+往返，两者都不改 fsync 时机，跟组提交不是同一件事。
+
+### 3. 为什么当前没做
+
+三个根因，缺一不可：
+
+1. **`IOEngine` 是同步接口**：`Write`/`Fsync` 返回即完成（`io_engine.h:13-14`），没有
+   「提交/完成」解耦，也就没有 pending SQE 队列和异步收割 CQE 的位置。
+2. **`Append` 的 write 内联**：`Append` 持锁 → `WriteAll` 写 syscall → 解锁
+   （`aof_writer.cpp:119-131`），每条记录当场写掉，没有攒批缓冲。
+3. **无批量 ack 机制**：命令 handler 是 `LogCommand` 返回后立即 `Reply`（如 `SetCommand`，
+   `string_commands.cpp:34-35`），回复与 AOF 完全解耦；要做组提交，得把「回复」推迟到
+   「这一批 fsync 完成」之后。
+
+（此外还有一条**约束**不是**根因**：同一 AOF 文件同一时刻只能有一批 IO in-flight，详见第 4 节末。）
+
+### 4. 落地顺序
+
+1. **posix 组提交**（先验证收益，不动 `src/io/` 一行）：`Append` 只把记录 append 进 pending
+   缓冲；flusher 攒够 N 条（或超时）后 `writev` + 一次 `fsync` + 批量 ack。效果档位：
+   `always` 数量级改善，`everysec` 中等，`no` 最小（本来就不 fsync）。
+2. **io_uring linked SQE**（叠异步化）：把 `write+fsync` 用 linked SQE 绑成一条链，一次
+   submit，fsync 完成后收割 CQE、批量 ack。额外拿到「准备/提交重叠」的二阶收益。
+3. **everysec 异步化**（可选，收益中等）：把 write 移出 `mu_` 临界区，锁内只剩 memcpy；
+   进一步可用收/刷双缓冲压锁。
+4. **回退路径**：io_uring 初始化失败 → 回退 posix 组提交（`CreateIOEngine` 已有回退，
+   `io_engine.cpp:12-25`）。组提交不降低 always 的持久性——只要 ack 发生在对这一批的 fsync
+   之后；它改变的是「何时 fsync」和「一次 fsync 覆盖几条命令」，不改变「ack 前数据已落盘」。
+   everysec 才是真正放松持久性的那一档（最多丢 1 秒），那是档位语义，不是组提交引入的。
+
+**一条必须踩住的刹车（AOF 顺序）**：同一 AOF 文件**同一时刻只能有一批 IO in-flight**。
+并发提交多个批次会导致 WRITE/FSYNC 完成顺序不保证、AOF 顺序崩坏。所以「异步化」的正确形态
+是**准备/提交重叠**：这批 CQE 未回时，用户态把下一批的 memcpy/iovec 准备好，CQE 回来再
+submit 下一批——**不是「提交/提交重叠」**。
+
+### 5. 面试收口一句话
+
+> always 的瓶颈是每条记录都持锁 fsync，主修复是组提交——把 fsync 从「每条」摊成「每批」、
+> 完成后再批量 ack，这是 posix 就能做的、与 io_uring 无关的收益；io_uring 的作用是在组提交
+> 之上，用 linked SQE 把 write+fsync 绑成一次提交、异步收割 CQE，并让「准备」与「fsync 延迟」
+> 重叠。落地先 posix 组提交验证收益，再上 io_uring；AOF 顺序靠「同一时刻只有一批 in-flight」
+> 保证，不是靠并发换吞吐。
+
 ---
 
 ## 附录 · 高频陷阱清单（面试官顺手就戳的细节）
@@ -280,7 +358,7 @@ LFU 用计数区分「偶发一次」和「长期高频」。LFU 适合热点稳
 - **lru 是 64 位 ms**：绕开了 Redis 24 位 lru 时钟约 194 天的回绕问题。
 - **`SET` 固定 arity 3**：无 NX/XX/EX/PX/GET 选项；无 SETEX/SETNX/APPEND/STRLEN。
   （`MGET`/`MSET` 已实现，见第 3 轮 Q1。）
-- **`DEL`/`EXISTS` 多 key 只作用第一个 key 的 shard**（见第 3 轮 Q1）。
+- **`DEL`/`EXISTS` 多 key 已走 scatter-gather**（`GroupKeysByShard` + `FanOut`），但跨 shard 不保证原子：可能部分成功、崩溃可能只应用部分 key、并发读者可能看到中间态（见第 3 轮 Q1）。
 - **`INCR` 溢出检查**：用 `__builtin_add_overflow`。
 - **哈希函数**：MurmurHash64A（路由和 bucket 层同一个，只是用法不同）。
 - **仍是 stub 的**：`LFU`（`lfu.h` 只有注释）、`zset`、`set` 集合类型、`Keyspace`（Week1 遗留

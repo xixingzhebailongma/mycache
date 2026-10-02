@@ -249,3 +249,41 @@ TEST(AofWriter, EmptyFileGetsHeader) {
   EXPECT_EQ(static_cast<size_t>(in.tellg()), aof::kMagicSize);
   ::unlink(path.c_str());
 }
+
+TEST(AofWriter, CompleteRewriteResetsBaseSize) {
+  std::string path = TempPath("rewritebase");
+  std::string temp = path + ".tmp";
+  ::unlink(path.c_str());
+  ::unlink(temp.c_str());
+
+  {
+    AofWriter w;
+    ASSERT_TRUE(w.Open(path, AofFsync::kNo));
+    uint64_t base0 = w.base_size();
+    EXPECT_EQ(base0, w.current_size());  // 打开后 base == current（magic 头）
+
+    w.Append(aof::EncodeRecord(aof::EncodeCommand("SET", {"a", "1"})));
+    EXPECT_GT(w.current_size(), base0);  // append 只增 current
+    EXPECT_EQ(w.base_size(), base0);     // base 不动
+
+    w.BeginRewrite();
+    EXPECT_EQ(w.base_size(), base0);     // 修复点：BeginRewrite 不再改 base
+
+    // 子进程产出的 compact temp：本测试只关心尺寸与 rename，内容任意。
+    std::string compact(64, 'x');
+    WriteFile(temp, compact);
+
+    // rewrite 期间写入：进 rewrite_buffer_，CompleteRewrite 会补到 temp 末尾。
+    std::string buf_rec = aof::EncodeRecord(aof::EncodeCommand("SET", {"b", "2"}));
+    w.Append(buf_rec);
+
+    ASSERT_TRUE(w.CompleteRewrite(temp));
+
+    // 修复点：rewrite 完成后 base == current ==（compact 尺寸 + buffer 尺寸）。
+    uint64_t expect = compact.size() + buf_rec.size();
+    EXPECT_EQ(w.current_size(), expect);
+    EXPECT_EQ(w.base_size(), expect);
+  }
+
+  ::unlink(path.c_str());
+}

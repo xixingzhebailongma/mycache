@@ -36,7 +36,10 @@ void LPushCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   // 记成 LPUSH（参数与收到的命令一致），重放时按同样顺序重建列表。
   std::vector<std::string> log = {args[1].str};
   log.insert(log.end(), values.begin(), values.end());
-  aof::LogCommand(ctx.aof, "LPUSH", log);
+  if (aof::LogCommand(ctx.aof, "LPUSH", log) != 0) {
+    ctx.ReplyError("AOF write failed");
+    return;
+  }
   ctx.ReplyInt(len);
 }
 
@@ -47,7 +50,10 @@ void RPushCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   int len = ctx.db->RPush(args[1].str, values);
   std::vector<std::string> log = {args[1].str};
   log.insert(log.end(), values.begin(), values.end());
-  aof::LogCommand(ctx.aof, "RPUSH", log);
+  if (aof::LogCommand(ctx.aof, "RPUSH", log) != 0) {
+    ctx.ReplyError("AOF write failed");
+    return;
+  }
   ctx.ReplyInt(len);
 }
 
@@ -56,7 +62,10 @@ void LPopCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   std::string v;
   if (ctx.db->LPop(args[1].str, &v)) {
     // 弹出是破坏性写，记成 LPOP（重放时逐次弹出，效果一致）。
-    aof::LogCommand(ctx.aof, "LPOP", {args[1].str});
+    if (aof::LogCommand(ctx.aof, "LPOP", {args[1].str}) != 0) {
+      ctx.ReplyError("AOF write failed");
+      return;
+    }
     ctx.ReplyBulk(v);
   } else {
     ctx.ReplyNull();
@@ -67,7 +76,10 @@ void RPopCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   if (!CheckListType(ctx, args[1].str)) return;
   std::string v;
   if (ctx.db->RPop(args[1].str, &v)) {
-    aof::LogCommand(ctx.aof, "RPOP", {args[1].str});
+    if (aof::LogCommand(ctx.aof, "RPOP", {args[1].str}) != 0) {
+      ctx.ReplyError("AOF write failed");
+      return;
+    }
     ctx.ReplyBulk(v);
   } else {
     ctx.ReplyNull();

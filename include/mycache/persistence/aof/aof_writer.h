@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "mycache/io/io_engine.h"
 
@@ -39,11 +40,14 @@ class AofWriter {
   void Close();
 
   // 线程安全：追加一条已编码的命令记录（见 aof_format.h 的 EncodeRecord）。
-  void Append(const std::string& record);
+  // 返回 0 成功，非 0 = errno。always 档在此阻塞等待本批 fsync 完成（组提交）。
+  int Append(const std::string& record);
 
   AofFsync policy() const { return policy_; }
   bool is_open() const { return fd_ >= 0; }
   uint64_t bytes_written() const { return bytes_written_.load(); }
+  uint64_t current_size() const { return current_size_.load(); }
+  uint64_t base_size() const { return base_size_.load(); }
 
   // ---- rewrite（Week 6）----
   // 开始缓冲并发追加：置 rewriting_=true 并清空 rewrite_buffer_。须在 fork 前、持
@@ -55,12 +59,13 @@ class AofWriter {
   bool CompleteRewrite(const std::string& temp_path);
   // 放弃 rewrite：清 buffer、rewriting_=false（子进程失败时调用，绝不 rename）。
   void AbortRewrite();
-  bool rewriting() const { return rewriting_; }
+  bool rewriting() const { return rewriting_.load(); }
 
  private:
-  bool WriteAll(const void* data, size_t len);
-  void Fsync();
-  void FlushLoop();  // everysec 后台线程
+  int WriteAll(const void* data, size_t len);          // 返回 0 / errno
+  void FlushLoop();                                     // everysec 后台线程
+  void GroupCommitLoop();                               // always 档组提交 flusher
+  int WriteBatch(const std::vector<std::string>& batch); // writev+fsync，返回 0 / errno
 
   int fd_ = -1;
   std::string path_;
@@ -74,10 +79,24 @@ class AofWriter {
   bool dirty_ = false;   // 自上次 fsync 以来有写入（mu_ 保护）
   std::thread flush_thread_;
 
-  bool rewriting_ = false;        // 是否正在 AOF rewrite（mu_ 保护）
-  std::string rewrite_buffer_;    // rewrite 期间并发写入的原始记录字节（mu_ 保护）
+  // ---- group commit（always）----
+  std::vector<std::string> pending_;       // 待 flush 记录（mu_ 保护）
+  std::condition_variable cv_flush_;       // 唤醒 flusher（mu_ 保护）
+  std::condition_variable batch_cv_;       // 唤醒等待者（mu_ 保护）
+  std::condition_variable io_done_cv_;     // 本轮锁外 IO 已结束（mu_ 保护）
+  bool group_commit_running_ = false;      // 组提交 flusher 开关（mu_ 保护）
+  std::thread group_commit_thread_;
+  bool io_in_flight_ = false;              // flusher 是否正在锁外 writev+fsync（mu_ 保护）
+  uint64_t submitted_ = 0;                 // 已 append 记录总数（token 来源，mu_ 保护）
+  uint64_t flushed_ = 0;                   // 已处理水位：成功或失败都推进（mu_ 保护）
+  int last_errno_ = 0;                     // sticky 失败 errno（mu_ 保护）
+
+  std::atomic<bool> rewriting_{false};   // 是否正在 AOF rewrite（原子，rewriting() 无锁读安全）
+  std::string rewrite_buffer_;           // rewrite 期间并发写入的原始记录字节（mu_ 保护）
 
   std::atomic<uint64_t> bytes_written_{0};
+  std::atomic<uint64_t> current_size_{0};       // 当前 AOF 文件大小（Append/CompleteRewrite 维护）
+  std::atomic<uint64_t> base_size_{0};          // 最新一次 rewrite 完成后的文件大小，作为增长基准（CompleteRewrite 更新）
 };
 
 // 解析配置字符串 "always"/"everysec"/"no"。非法值返回 false。

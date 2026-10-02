@@ -1,12 +1,14 @@
 #include "mycache/server/server.h"
 
 #include <sys/eventfd.h>
+#include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
 #include <csignal>
+#include <cstring>
 #include <string>
 
 #include "mycache/command/command.h"
@@ -31,6 +33,10 @@ namespace {
 Server* g_server = nullptr;
 int g_signal_fd = -1;
 int g_child_fd = -1;
+
+// 自动 AOF rewrite 的检查周期（秒）。timerfd 每隔这么久到期一次，主循环读空到期计数
+// 后调 PersistenceManager::MaybeAutoRewrite()。
+constexpr int kAutoRewriteIntervalSec = 1;
 
 void SignalHandler(int /*sig*/) {
   uint64_t one = 1;
@@ -121,6 +127,26 @@ void Server::Start() {
   child_channel_->EnableReading();
   ::signal(SIGCHLD, ChildSignalHandler);
 
+  // 自动 AOF rewrite 检查定时器：create/settime 任一步失败都记日志并禁用（保持
+  // tick_fd_ = -1，HandleAutoRewriteTick 对 -1 直接返回），不因此拒绝启动。
+  tick_fd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+  if (tick_fd_ < 0) {
+    LOG_WARN("timerfd_create failed, auto AOF rewrite disabled: %s", std::strerror(errno));
+  } else {
+    struct itimerspec its {};
+    its.it_interval.tv_sec = kAutoRewriteIntervalSec;
+    its.it_value.tv_sec = kAutoRewriteIntervalSec;
+    if (::timerfd_settime(tick_fd_, 0, &its, nullptr) != 0) {
+      LOG_WARN("timerfd_settime failed, auto AOF rewrite disabled: %s", std::strerror(errno));
+      sockets::Close(tick_fd_);
+      tick_fd_ = -1;
+    } else {
+      tick_channel_ = std::make_unique<Channel>(&main_loop_, tick_fd_);
+      tick_channel_->SetReadCallback([this] { HandleAutoRewriteTick(); });
+      tick_channel_->EnableReading();
+    }
+  }
+
   acceptor_ = std::make_unique<Acceptor>(&main_loop_, config_.bind, config_.port, config_.tcp_backlog);
   if (!acceptor_->valid()) {
     LOG_FATAL("failed to create acceptor on %s:%d", config_.bind.c_str(), config_.port);
@@ -144,6 +170,14 @@ void Server::Stop() {
   for (auto& r : io_reactors_) r->Stop();
   router_.Stop();
   pm_.Close();  // 优雅关闭：flush + fsync
+  // 先摘除 tick Channel（从 epoll + channels_ 移除）再关 fd，避免 EventLoop 里残留
+  // 指向已关 fd 的 Channel（fd 号可能被复用）。Channel 无析构，reset() 前必须显式 Remove()。
+  if (tick_channel_) {
+    tick_channel_->Remove();
+    tick_channel_.reset();
+  }
+  if (tick_fd_ >= 0) sockets::Close(tick_fd_);
+  tick_fd_ = -1;
   main_loop_.Quit();
 }
 
@@ -167,6 +201,15 @@ void Server::HandleChildExit() {
   }
 }
 
+void Server::HandleAutoRewriteTick() {
+  if (tick_fd_ < 0) return;  // timerfd 创建/settime 失败已禁用
+  uint64_t expirations = 0;
+  ssize_t n = ::read(tick_fd_, &expirations, sizeof expirations);
+  // 只有读满 8 字节（一次到期计数）才触发检查；EAGAIN（已被消费）/EINTR/短读都跳过。
+  if (n != static_cast<ssize_t>(sizeof expirations)) return;
+  pm_.MaybeAutoRewrite();
+}
+
 void Server::OnNewConnection(int fd, const std::string& peer) {
   if (stopping_) {
     sockets::Close(fd);
@@ -181,19 +224,17 @@ void Server::OnNewConnection(int fd, const std::string& peer) {
 }
 
 void Server::OnMessage(const std::shared_ptr<Connection>& conn, Buffer* buf) {
-  RespParser parser;
+  RespParser& parser = conn->parser();
   while (buf->readable() > 0) {
-    // 跳过多余的 CR/LF 字节（例如 redis-cli --pipe 在其 ECHO 哨兵之前追加的
-    // 结尾 CRLF）。
-    while (buf->readable() > 0 && (buf->peek()[0] == '\r' || buf->peek()[0] == '\n')) {
-      buf->retrieve(1);
-    }
-    if (buf->readable() == 0) break;
-
     size_t consumed = 0;
     RespValue cmd;
     ParseResult r = parser.Parse(buf->peek(), buf->readable(), &consumed, &cmd);
-    if (r == ParseResult::kIncomplete) return;  // 等待更多字节
+    if (r == ParseResult::kIncomplete) {
+      // 有状态增量解析：半包时 consumed 也可能 > 0，必须丢弃已消费前缀，否则下次
+      // 会重复解析同一段。
+      buf->retrieve(consumed);
+      return;
+    }
     if (r == ParseResult::kError) {
       conn->Send(EncodeResp(RespValue::Error("ERR Protocol error: invalid multibulk length")));
       conn->Shutdown();

@@ -155,7 +155,7 @@ TEST(RehashTest, RehashCompletesAndSwapsTables) {
   }
 }
 
-// const Find 必须保持纯只读：反复查询也不推进 rehash（这是 Keyspace 共享锁读路径
+// const Find 必须保持纯只读：反复查询也不推进 rehash（这是共享锁读路径
 // 成立的契约）。
 TEST(RehashTest, ReadOnlyFindDoesNotAdvanceRehash) {
   Dict d(TestType());

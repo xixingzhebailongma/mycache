@@ -4,6 +4,7 @@
 #include <memory>
 #include <string>
 #include <sys/types.h>
+#include <sys/uio.h>
 
 namespace mycache {
 
@@ -18,6 +19,14 @@ class IOEngine {
 
   virtual int Open(const std::string& path, int flags, int mode) = 0;
   virtual ssize_t Write(int fd, const void* buf, size_t len) = 0;
+  // 一次写入多个不连续 buffer（AOF 组提交攒批用）。语义同 Write：写满才返回（失败 -1）。
+  virtual ssize_t Writev(int fd, const iovec* iov, int iovcnt) = 0;
+  // 一次 writev + fsync（组提交的批量落盘原语）。语义同 Writev：写满并 fsync 成功才
+  // 返回，返回写入总字节数（失败 -1）。posix 顺序 writev 后 fsync；io_uring 用
+  // linked SQE（WRITEV -> FSYNC）单次 submit。linked SQE 下若 WRITEV 短写，link 的
+  // FSYNC 仍会触发——本轮得到的是「部分数据已 fsync」的中间状态，剩余字节由下一轮
+  // WRITEV+FSYNC 补齐。AOF 写普通文件几乎不短写，代价可接受。
+  virtual ssize_t WritevFsync(int fd, const iovec* iov, int iovcnt) = 0;
   virtual ssize_t Pread(int fd, void* buf, size_t len, off_t off) = 0;
   virtual int Fsync(int fd) = 0;
   virtual int Ftruncate(int fd, off_t len) = 0;

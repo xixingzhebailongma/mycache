@@ -474,6 +474,14 @@ size_t Shard::ExpireCount() const {
   return expire_count_.load(std::memory_order_relaxed);
 }
 
+void Shard::FlushAll() {
+  dict_.Clear();   // 逐条 FreeEntry -> ObjectFree -> DecrRefCount，回扣 MemoryStats
+  expires_.Clear();
+  // Dict::Clear() 不碰 Shard 手动维护的原子计数，必须手动复位，否则 Size()/ExpireCount() 残留旧值。
+  key_count_.store(0, std::memory_order_relaxed);
+  expire_count_.store(0, std::memory_order_relaxed);
+}
+
 void Shard::ScanSnapshot(SnapshotVisitor visit, void* ud) const {
   // 遍历 dict_ 两张表（rehash 期间条目分散在两表，都要走一遍）。
   for (int t = 0; t < 2; ++t) {

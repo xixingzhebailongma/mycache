@@ -34,13 +34,13 @@ uint64_t DictHash(const void* data, size_t len);
 
 // Redis 风格的字典：单独链地址 + 双哈希表 + 渐进式 rehash。
 //
-// - 查询分两种：const `Find` 只读、不推进 rehash（供共享锁读路径，如 Keyspace）；
+// - 查询分两种：const `Find` 只读、不推进 rehash（供共享锁读路径）；
 //   非 const `FindAndRehash` 先 RehashStep 再查两张表（供单线程读路径，如 Shard，
 //   对齐 Redis dictFind）。写路径（Add/Delete/Replace）始终通过 RehashStep 推进。
 // - 扩容/收缩通过 Expand 触发，分配 ht[1] 并把 rehashidx 置 0；之后每次写操作
 //   迁移少量桶，直到 ht[0] 清空后交换两表。
 //
-// 非线程安全；并发保护由上层（Keyspace）提供。
+// 非线程安全；并发保护由上层提供。
 class Dict {
  public:
   explicit Dict(DictType* type);

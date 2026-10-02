@@ -33,6 +33,7 @@ class Server {
   void DispatchCommand(const std::shared_ptr<Connection>& conn, const RespValue& cmd);
   void HandleSignalRead();
   void HandleChildExit();  // SIGCHLD 收割 rewrite/bgsave 子进程并收尾
+  void HandleAutoRewriteTick();  // timerfd 到期：读空后检查并触发自动 AOF rewrite
 
   Config config_;
   CommandTable command_table_;
@@ -49,6 +50,8 @@ class Server {
   std::unique_ptr<Channel> signal_channel_;
   int child_fd_ = -1;
   std::unique_ptr<Channel> child_channel_;
+  int tick_fd_ = -1;
+  std::unique_ptr<Channel> tick_channel_;
   std::atomic<bool> stopping_{false};
 };
 

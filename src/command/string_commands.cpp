@@ -31,7 +31,10 @@ void PingCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
 void SetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   if (!EvictOrOom(ctx)) return;
   ctx.db->Set(args[1].str, args[2].str);
-  aof::LogCommand(ctx.aof, "SET", {args[1].str, args[2].str});
+  if (aof::LogCommand(ctx.aof, "SET", {args[1].str, args[2].str}) != 0) {
+    ctx.ReplyError("AOF write failed");
+    return;
+  }
   ctx.ReplySimple("OK");
 }
 
@@ -53,23 +56,30 @@ void DelCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
 
   auto groups = GroupKeysByShard(*ctx.router, *keys);
   auto total = std::make_shared<std::atomic<int64_t>>(0);
+  auto aof_err = std::make_shared<std::atomic<bool>>(false);
   std::shared_ptr<Connection> conn = ctx.conn;
   AofWriter* aof = ctx.aof;
 
   FanOut(ctx.router, groups,
-         [keys, total, aof](Shard* shard, const KeyGroup& g) {
+         [keys, total, aof, aof_err](Shard* shard, const KeyGroup& g) {
            std::vector<std::string> sub;
            sub.reserve(g.indices.size());
            for (size_t i : g.indices) sub.push_back((*keys)[i]);
            int removed = shard->Del(sub);
            // 逐 shard 记日志：每条 DEL 的 key 都落在同一个 shard，AOF 恢复按
            // 首 key 路由不会漏删跨 shard 的 key。
-           if (removed > 0) aof::LogCommand(aof, "DEL", sub);
+           if (removed > 0 && aof::LogCommand(aof, "DEL", sub) != 0) {
+             aof_err->store(true, std::memory_order_relaxed);
+           }
            total->fetch_add(removed, std::memory_order_relaxed);
          },
-         [conn, total]() {
-           conn->Send(EncodeResp(
-               RespValue::Integer(total->load(std::memory_order_relaxed))));
+         [conn, total, aof_err]() {
+           if (aof_err->load(std::memory_order_relaxed)) {
+             conn->Send(EncodeResp(RespValue::Error("AOF write failed")));
+           } else {
+             conn->Send(EncodeResp(
+                 RespValue::Integer(total->load(std::memory_order_relaxed))));
+           }
          });
 }
 
@@ -118,11 +128,12 @@ void MSetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
 
   auto groups = GroupKeysByShard(*ctx.router, *keys);
   auto oom = std::make_shared<std::atomic<bool>>(false);
+  auto aof_err = std::make_shared<std::atomic<bool>>(false);
   std::shared_ptr<Connection> conn = ctx.conn;
   AofWriter* aof = ctx.aof;
 
   FanOut(ctx.router, groups,
-         [keys, values, oom, aof](Shard* shard, const KeyGroup& g) {
+         [keys, values, oom, aof_err, aof](Shard* shard, const KeyGroup& g) {
            // 每个 shard 写自己的 key 前检查内存（跨 shard 不保证原子，见方案说明）。
            if (!shard->EvictIfNeeded()) {
              oom->store(true, std::memory_order_relaxed);
@@ -131,13 +142,17 @@ void MSetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
            for (size_t i : g.indices) {
              shard->Set((*keys)[i], (*values)[i]);
              // 记成逐条 SET：幂等自包含，恢复按首 key 路由正确。
-             aof::LogCommand(aof, "SET", {(*keys)[i], (*values)[i]});
+             if (aof::LogCommand(aof, "SET", {(*keys)[i], (*values)[i]}) != 0) {
+               aof_err->store(true, std::memory_order_relaxed);
+             }
            }
          },
-         [conn, oom]() {
+         [conn, oom, aof_err]() {
            if (oom->load(std::memory_order_relaxed)) {
              conn->Send(EncodeResp(RespValue::Error(
                  "OOM command not allowed when used memory > 'maxmemory'")));
+           } else if (aof_err->load(std::memory_order_relaxed)) {
+             conn->Send(EncodeResp(RespValue::Error("AOF write failed")));
            } else {
              conn->Send(EncodeResp(RespValue::Simple("OK")));
            }
@@ -173,7 +188,10 @@ void IncrByCommand(CommandContext& ctx, const std::vector<RespValue>& args, long
   // 记成 SET（绝对结果），AOF 重放时结果确定，且不依赖 INCR 的增量语义。
   std::string nv = std::to_string(result);
   ctx.db->Set(args[1].str, nv);
-  aof::LogCommand(ctx.aof, "SET", {args[1].str, nv});
+  if (aof::LogCommand(ctx.aof, "SET", {args[1].str, nv}) != 0) {
+    ctx.ReplyError("AOF write failed");
+    return;
+  }
   ctx.ReplyInt(result);
 }
 

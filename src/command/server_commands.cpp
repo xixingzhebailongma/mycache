@@ -71,6 +71,20 @@ void BgSaveCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   else ctx.ReplyError(err);
 }
 
+// LOAD：运行时从 RDB 整库重载，覆盖当前内存数据（DEBUG RELOAD 风格）。
+// 当前 arity=1、不支持 LOAD <filename>；未来若支持指定文件，需改 arity 为 -1
+// 并在 handler 里解析 args[1] 作为路径。
+void LoadCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
+  (void)args;
+  if (!ctx.pm) {
+    ctx.ReplyError("ERR internal: persistence manager unavailable");
+    return;
+  }
+  std::string err;
+  if (ctx.pm->Load(&err)) ctx.ReplySimple("OK");
+  else ctx.ReplyError(err);
+}
+
 }  // namespace
 
 void RegisterServerCommands(CommandTable* table) {
@@ -79,6 +93,7 @@ void RegisterServerCommands(CommandTable* table) {
   table->Register(Command{"bgrewriteaof", 1, 0, BgRewriteAofCommand});
   table->Register(Command{"save", 1, 0, SaveCommand});
   table->Register(Command{"bgsave", 1, 0, BgSaveCommand});
+  table->Register(Command{"load", 1, 0, LoadCommand});
 }
 
 }  // namespace mycache

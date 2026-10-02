@@ -23,7 +23,10 @@ void HSetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   if (!CheckHashType(ctx, args[1].str)) return;
   if (!EvictOrOom(ctx)) return;
   int added = ctx.db->HSet(args[1].str, args[2].str, args[3].str);
-  aof::LogCommand(ctx.aof, "HSET", {args[1].str, args[2].str, args[3].str});
+  if (aof::LogCommand(ctx.aof, "HSET", {args[1].str, args[2].str, args[3].str}) != 0) {
+    ctx.ReplyError("AOF write failed");
+    return;
+  }
   ctx.ReplyInt(added);
 }
 
@@ -43,7 +46,10 @@ void HDelCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   if (removed > 0) {
     std::vector<std::string> log = {args[1].str};
     log.insert(log.end(), fields.begin(), fields.end());
-    aof::LogCommand(ctx.aof, "HDEL", log);
+    if (aof::LogCommand(ctx.aof, "HDEL", log) != 0) {
+      ctx.ReplyError("AOF write failed");
+      return;
+    }
   }
   ctx.ReplyInt(removed);
 }

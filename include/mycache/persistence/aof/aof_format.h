@@ -33,7 +33,8 @@ std::string EncodeCommand(const std::string& name, const std::vector<std::string
 std::string EncodeRecord(const std::string& payload);
 
 // 若 aof 非空，把 name+args 编码为一条记录并追加（AOF 未开启时是空操作）。
-void LogCommand(AofWriter* aof, const std::string& name, const std::vector<std::string>& args);
+// 返回 0 成功，非 0 = errno（透传 AofWriter::Append）。
+int LogCommand(AofWriter* aof, const std::string& name, const std::vector<std::string>& args);
 
 }  // namespace aof
 }  // namespace mycache

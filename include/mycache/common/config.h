@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cctype>
+#include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -59,6 +61,8 @@ struct Config {
   std::string appendfilename = "appendonly.aof";
   std::string appendfsync = "everysec"; // always / everysec / no
   std::string dir;                      // AOF 文件目录；空或 "." 表示当前目录
+  int64_t aof_rewrite_min_size = 64 * 1024 * 1024;  // 触发自动 rewrite 的最小 AOF 大小（默认 64mb）
+  int     aof_rewrite_percentage = 100;             // 相对上次 rewrite 的增长百分比；<=0 关闭自动 rewrite
 
   // ---- 内存治理 (Week 5) ----
   int64_t maxmemory = 0;                 // 内存上限（字节）；0 = 不限制
@@ -117,6 +121,15 @@ struct Config {
     else if (key == "maxmemory_samples") maxmemory_samples = std::atoi(value.c_str());
     else if (key == "dbfilename") dbfilename = value;
     else if (key == "io_engine") io_engine = value;
+    else if (key == "auto-aof-rewrite-min-size") { int64_t v = 0; if (ParseMemorySize(value, &v)) aof_rewrite_min_size = v; }
+    else if (key == "auto-aof-rewrite-percentage") {
+      // 只拒绝非数字/越界；负值保留（由 ShouldAutoRewrite 的 percentage<=0 处理"关闭"）。
+      char* end = nullptr; errno = 0;
+      long v = std::strtol(value.c_str(), &end, 10);
+      if (end != value.c_str() && *end == '\0' && errno != ERANGE &&
+          v >= INT_MIN && v <= INT_MAX)
+        aof_rewrite_percentage = static_cast<int>(v);
+    }
   }
 };
 
