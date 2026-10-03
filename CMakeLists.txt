@@ -92,4 +92,12 @@ if(MYCACHE_BUILD_BENCH)
   # IOEngine write+fsync 压测（posix vs io_uring）。
   add_executable(mycache_io_bench benchmark/io_bench.cpp)
   target_link_libraries(mycache_io_bench PRIVATE mycache_core)
+  # Upgrade 1：按命名规范拆分的三个基准客户端。
+  #   get_set      —— 单连接 round-trip，测 QPS + P50/P99（真实往返延迟）
+  #   pipeline     —— 深度流水线，测吞吐上限（迁移自 pipeline_test.cpp）
+  #   concurrency  —— 多连接多线程并发，测聚合 QPS + P50/P99
+  add_executable(mycache_get_set_bench benchmark/benchmark_get_set.cpp)
+  add_executable(mycache_pipeline_bench benchmark/benchmark_pipeline.cpp)
+  add_executable(mycache_concurrency_bench benchmark/benchmark_concurrency.cpp)
+  target_link_libraries(mycache_concurrency_bench PRIVATE Threads::Threads)
 endif()

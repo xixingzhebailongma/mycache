@@ -1,0 +1,3 @@
+requests (one pipelined batch): 200000
+SET:   174392 req/s  (1.147 s)
+GET:   224653 req/s  (0.890 s)

@@ -1,6 +1,9 @@
 // 流水线式 SET/GET 基准测试客户端。一次性批量发送全部 N 条命令（深度流水线），
 // 并读回所有回复，统计吞吐量。
 //
+// 注：本文件已被 benchmark/benchmark_pipeline.cpp 取代（Upgrade 1 命名规范，行为等价），
+// 保留仅用于向后兼容（构建目标 mycache_bench）。新的压测请用 mycache_pipeline_bench。
+//
 // 用法：mycache_bench [host] [port] [nreq]
 
 #include <arpa/inet.h>

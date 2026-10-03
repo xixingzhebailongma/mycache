@@ -1,0 +1,3 @@
+concurrency benchmark: host=127.0.0.1 port=6383 conns=50 threads=50 per_conn=4000 value=64B (total per phase=200000)
+SET  QPS=   59920  P50=  0.755ms  P99=  1.610ms  (n=200000)
+GET  QPS=   61477  P50=  0.737ms  P99=  1.588ms  (n=200000)

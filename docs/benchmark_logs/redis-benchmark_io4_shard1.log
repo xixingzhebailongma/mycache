@@ -1,0 +1,38 @@
+ERROR: ERR unknown command 'config'
+ERROR: failed to fetch CONFIG from 127.0.0.1:6382
+WARN: could not fetch server CONFIG
+SET: 0.00SET: 114266.94SET: 114255.49SET: 111430.09SET: 110538.45SET: 109744.20SET: 109648.23SET: 109569.38====== SET ======
+  200000 requests completed in 1.82 seconds
+  50 parallel clients
+  64 bytes payload
+  keep alive: 1
+  multi-thread: no
+
+0.01% <= 0.1 milliseconds
+7.56% <= 0.2 milliseconds
+64.30% <= 0.3 milliseconds
+89.84% <= 0.4 milliseconds
+96.73% <= 0.5 milliseconds
+98.82% <= 0.6 milliseconds
+99.59% <= 0.7 milliseconds
+99.87% <= 0.8 milliseconds
+99.94% <= 0.9 milliseconds
+99.97% <= 1.0 milliseconds
+99.99% <= 1.1 milliseconds
+99.99% <= 2 milliseconds
+100.00% <= 2 milliseconds
+109769.48 requests per second
+
+GET: 111134.97GET: 113256.66GET: 108666.67GET: 110447.98GET: 111173.69GET: 108145.09GET: 108533.38====== GET ======
+  200000 requests completed in 1.89 seconds
+  50 parallel clients
+  64 bytes payload
+  keep alive: 1
+  multi-thread: no
+
+99.64% <= 1 milliseconds
+99.99% <= 2 milliseconds
+100.00% <= 2 milliseconds
+105932.20 requests per second
+
+

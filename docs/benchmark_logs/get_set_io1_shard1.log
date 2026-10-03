@@ -1,0 +1,3 @@
+single-connection round-trip benchmark: host=127.0.0.1 port=6381 nreq=20000 value=64B
+SET  QPS=    9536  P50=  0.097ms  P99=  0.200ms
+GET  QPS=    9283  P50=  0.098ms  P99=  0.214ms

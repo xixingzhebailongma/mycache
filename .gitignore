@@ -25,3 +25,5 @@ compile_commands.json
 *.log
 *.aof
 *.rdb
+# 但 benchmark 原始压测日志要入库（docs/benchmark_logs/ 是性能报告的原始证据）。
+!docs/benchmark_logs/*.log
