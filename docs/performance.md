@@ -255,12 +255,29 @@ std::string 物化 + vector 扩容 + memcpy）；`std::function` 那 27% 里类�
 
 ### 11.2 累计与口径
 
-- 分配（内存池，§10）−0.48% + 解析三步，相乘累计 **−12.5% 总指令 Ir**（相对
-  pool-off 起点 234,988,938 → Step 3 的 205,620,963）。**这是 callgrind 总指令口径，
-  不是 QPS**。
-- QPS 在 WSL2 单次方差 ~10%，不作为主口径。
+- 分配（内存池，§10）−0.48% + 解析三步 + AOF 参数打包（§11.3），相乘累计：
+
+| 阶段 | 总 Ir 中位 | 相对 pool-off 累计 |
+|---|---|---|
+| pool-off 起点 | 234,988,938 | — |
+| Step 3（parser 三步） | 205,620,963 | −12.5% |
+| AOF 参数打包 | 187,379,359 | **−20.26%** |
+
+- **这是 callgrind 总指令口径，不是 QPS**。QPS 在 WSL2 单次方差 ~10%，不作为主口径。
+
+### 11.3 AOF 参数打包 + 方法论
+
+`SetCommand` 的 `LogCommand(ctx.aof, "SET", {key, value})` 用 initializer_list 打包
+`vector<string>`，在 `LogCommand` 的 null 早退**之前**就发生了。改成变参模板
+`LogCommand(aof, name, strs...)`（SFINAE 排除 vector 重载，避免抢走 DEL/LPUSH 的
+vector 重载），null 早退在构造 vector 之前。AOF off 时省掉整套 double-copy，−8.87%
+（不是树里单层的 3.17%）。
+
+**方法论（面试素材）**：callgrind 树标的是函数**自成本**，包装层 / 临时对象的成本
+（initializer_list 临时数组的构造+析构、string 拷贝）**散在 caller 的 self 里，不会
+自动归到被调方名下**。树里单层占比是**最低估计**，双层拷贝模式要手动加。
 
 简历 bullet（锁定，不改）：
 > 用 callgrind 拆解 RESP 解析 inclusive vs self 热点，通过 vector reserve、手写整数
 > 解析、bulk string 零拷贝（view 延迟物化 + 跨 readFd 回退）三步，请求路径总指令数
-> 累计下降 12.5%。
+> 累计下降 20.3%。
