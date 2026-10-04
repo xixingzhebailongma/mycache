@@ -1,0 +1,12 @@
+# Step 3 —— bulk string 零拷贝（方案 3：Route 边界深拷贝）
+# date: 2026-10-04T16:19:42+08:00
+# binary: build-prof/mycache-server (RelWithDebInfo, jemalloc, pool ON)
+# conf: io_threads 1 / shard_count 1, AOF off, port 6386
+# cmd: redis-benchmark -p 6386 -t set -n 20000 -c 50 -d 64
+# 方法: callgrind 3 次，总 Ir 取中位；对照基线 parser_step3_baseline.log
+baseline median total_Ir=213263153
+run1 total_Ir=205680088
+run2 total_Ir=205620963
+run3 total_Ir=205223870
+median total_Ir=205620963
+delta = -3.58%  (213263153 -> 205620963)

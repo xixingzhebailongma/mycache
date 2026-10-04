@@ -30,6 +30,10 @@ void CommandRouter::Route(const std::string& key, std::function<void(Shard*)> fn
   RouteTo(ShardIndex(key), std::move(fn));
 }
 
+void CommandRouter::Route(std::string_view key, std::function<void(Shard*)> fn) {
+  RouteTo(DictHash(key.data(), key.size()) % shards_.size(), std::move(fn));
+}
+
 void CommandRouter::RouteTo(size_t shard_index, std::function<void(Shard*)> fn) {
   shards_[shard_index]->Submit([fn = std::move(fn)](Shard* shard) {
     // 任务执行期间持快照闸门的 shared 锁，保证 fork 快照不会看到半修改的 shard。

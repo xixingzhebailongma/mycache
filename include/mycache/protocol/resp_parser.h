@@ -51,6 +51,10 @@ class RespParser {
   // *out。
   bool Commit(RespValue value, RespValue* out);
 
+  // kIncomplete 返回前物化已提交的借引用：命令跨 readFd 时缓冲会 realloc/压缩，
+  // 存进 stack_/current_ 的 view 会悬空，必须在把控制权交还调用方前转成 owned str。
+  void MaterializeIncomplete();
+
   Step step_ = Step::kType;
   LineKind line_kind_ = LineKind::kSimple;
   std::vector<Frame> stack_;   // 嵌套 array 栈；size() 即当前深度

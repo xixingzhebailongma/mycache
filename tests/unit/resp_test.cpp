@@ -17,6 +17,7 @@ void ExpectParse(const std::string& input, RespValue* out) {
   size_t consumed = 0;
   ASSERT_EQ(p.Parse(input.data(), input.size(), &consumed, out), ParseResult::kOk);
   EXPECT_EQ(consumed, input.size());
+  out->Materialize();  // 物化借引用，后续断言 v.str 才有值
 }
 
 // 断言输入触发协议错误（kError），不产生 UB、不崩溃。
@@ -43,7 +44,7 @@ RespValue StreamParse(const std::string& data, size_t chunk) {
       ADD_FAILURE() << "parse error during streaming at offset " << i;
       return RespValue{};
     }
-    if (r == ParseResult::kOk) return v;
+    if (r == ParseResult::kOk) { v.Materialize(); return v; }
   }
   ADD_FAILURE() << "command never completed";
   return RespValue{};
@@ -149,6 +150,7 @@ TEST(RespParserTest, IncompleteThenComplete) {
   std::string part2 = "t\r\n$3\r\nfoo\r\n";
   EXPECT_EQ(p.Parse(part2.data(), part2.size(), &consumed, &v), ParseResult::kOk);
   EXPECT_EQ(consumed, part2.size());
+  v.Materialize();
   ASSERT_EQ(v.array.size(), 2u);
   EXPECT_EQ(v.array[0].str, "get");
   EXPECT_EQ(v.array[1].str, "foo");
@@ -194,6 +196,7 @@ TEST(RespParserTest, BulkTrailerSplit) {
   std::string part2 = "\r\n";
   EXPECT_EQ(p.Parse(part2.data(), part2.size(), &consumed, &v), ParseResult::kOk);
   EXPECT_EQ(consumed, 2u);
+  v.Materialize();
   EXPECT_EQ(v.type, RespType::kBulkString);
   EXPECT_EQ(v.str, "hello");
 }
@@ -221,6 +224,7 @@ TEST(RespParserTest, ResetAfterError) {
   p.Reset();
   // Reset 后同一实例能正常解析新命令。
   EXPECT_EQ(p.Parse("+OK\r\n", 5, &consumed, &v), ParseResult::kOk);
+  v.Materialize();
   EXPECT_EQ(v.type, RespType::kSimpleString);
   EXPECT_EQ(v.str, "OK");
 }
@@ -232,9 +236,11 @@ TEST(RespParserTest, PipelineTwoCommands) {
   // 同一实例连续解析两条命令，中间状态无残留。
   EXPECT_EQ(p.Parse("*1\r\n$4\r\nPING\r\n", 14, &consumed, &v), ParseResult::kOk);
   EXPECT_EQ(consumed, 14u);
+  v.Materialize();
   EXPECT_EQ(v.array[0].str, "PING");
   EXPECT_EQ(p.Parse("*1\r\n$4\r\nPING\r\n", 14, &consumed, &v), ParseResult::kOk);
   EXPECT_EQ(consumed, 14u);
+  v.Materialize();
   EXPECT_EQ(v.array[0].str, "PING");
 }
 
@@ -256,6 +262,7 @@ TEST(RespParserTest, SkipsInterCommandCrlf) {
   std::string leading = "\r\n*1\r\n$4\r\nPING\r\n";
   EXPECT_EQ(p.Parse(leading.data(), leading.size(), &consumed, &v), ParseResult::kOk);
   EXPECT_EQ(consumed, leading.size());
+  v.Materialize();
   EXPECT_EQ(v.array[0].str, "PING");
 
   // 命令后的杂散 CR/LF 留在缓冲，下次 Parse 被跳过。
@@ -265,6 +272,99 @@ TEST(RespParserTest, SkipsInterCommandCrlf) {
   std::string stray = "\r\n";
   EXPECT_EQ(p.Parse(stray.data(), stray.size(), &consumed, &v), ParseResult::kIncomplete);
   EXPECT_EQ(consumed, stray.size());
+}
+
+// ---- 零拷贝 view 语义（Step 3）----
+// Parse 存借引用（view），物化推迟到拷贝构造 / 显式 Materialize。
+
+TEST(RespParserTest, CopyMaterializesView) {
+  // 模拟 keyed 路径：Parse 后 view 非空、str 空；args = cmd.array 拷贝触发物化。
+  RespParser p;
+  size_t consumed = 0;
+  RespValue v;
+  std::string data = "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+  ASSERT_EQ(p.Parse(data.data(), data.size(), &consumed, &v), ParseResult::kOk);
+  ASSERT_EQ(v.array.size(), 2u);
+  EXPECT_NE(v.array[0].view.data(), nullptr);
+  EXPECT_TRUE(v.array[0].str.empty());
+
+  std::vector<RespValue> args = v.array;  // 拷贝构造器物化
+  EXPECT_EQ(args[0].str, "foo");
+  EXPECT_EQ(args[1].str, "bar");
+  EXPECT_EQ(args[0].view.data(), nullptr);
+}
+
+TEST(RespParserTest, MovePreservesView) {
+  RespParser p;
+  size_t consumed = 0;
+  RespValue v;
+  std::string data = "$3\r\nfoo\r\n";
+  ASSERT_EQ(p.Parse(data.data(), data.size(), &consumed, &v), ParseResult::kOk);
+  EXPECT_NE(v.view.data(), nullptr);
+
+  RespValue m = std::move(v);  // move 浅搬 view，不物化（零拷贝前提）
+  EXPECT_NE(m.view.data(), nullptr);
+  EXPECT_TRUE(m.str.empty());
+
+  RespValue c = m;  // copy 才物化
+  EXPECT_EQ(c.str, "foo");
+  EXPECT_EQ(c.view.data(), nullptr);
+}
+
+TEST(RespParserTest, MoveAssignPreservesView) {
+  RespParser p;
+  size_t consumed = 0;
+  RespValue v;
+  std::string data = "$3\r\nfoo\r\n";
+  ASSERT_EQ(p.Parse(data.data(), data.size(), &consumed, &v), ParseResult::kOk);
+
+  RespValue m;
+  m = std::move(v);  // move 赋值浅搬 view
+  EXPECT_NE(m.view.data(), nullptr);
+  EXPECT_TRUE(m.str.empty());
+
+  RespValue c = m;
+  EXPECT_EQ(c.str, "foo");
+}
+
+TEST(RespParserTest, MaterializeClearsView) {
+  RespParser p;
+  size_t consumed = 0;
+  RespValue v;
+  std::string data = "*1\r\n$4\r\nPING\r\n";
+  ASSERT_EQ(p.Parse(data.data(), data.size(), &consumed, &v), ParseResult::kOk);
+  EXPECT_NE(v.array[0].view.data(), nullptr);
+
+  v.Materialize();
+  EXPECT_EQ(v.array[0].str, "PING");
+  EXPECT_EQ(v.array[0].view.data(), nullptr);  // 物化后 view 清空，强制不变量
+}
+
+TEST(RespParserTest, PartialBulkFallsBackToMaterialize) {
+  RespParser p;
+  size_t consumed = 0;
+  RespValue v;
+  // body "hello" 拆两段：第一段不完整 → 回退 str.append，不存 view。
+  EXPECT_EQ(p.Parse("$5\r\nhe", 6, &consumed, &v), ParseResult::kIncomplete);
+  EXPECT_EQ(p.Parse("llo\r\n", 6, &consumed, &v), ParseResult::kOk);
+  EXPECT_EQ(v.str, "hello");
+  EXPECT_EQ(v.view.data(), nullptr);  // 回退物化：view 为空
+}
+
+TEST(RespParserTest, EmptyBulkIsNotNullAfterCopy) {
+  RespParser p;
+  size_t consumed = 0;
+  RespValue v;
+  ASSERT_EQ(p.Parse("$0\r\n\r\n", 6, &consumed, &v), ParseResult::kOk);
+  EXPECT_EQ(v.type, RespType::kBulkString);
+  // $0 走 kBulkCrlf（跳过 kBulkBody），view 未设置（data()==nullptr），str 空。
+  EXPECT_EQ(v.view.data(), nullptr);
+  EXPECT_TRUE(v.str.empty());
+
+  RespValue c = v;  // 拷贝（Route）：空 bulk 仍是空串，不是 null 也不是垃圾
+  EXPECT_EQ(c.type, RespType::kBulkString);
+  EXPECT_EQ(c.str, "");
+  EXPECT_EQ(c.view.data(), nullptr);
 }
 
 TEST(RespEncoderTest, RoundTrip) {

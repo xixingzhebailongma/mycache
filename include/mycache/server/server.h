@@ -30,7 +30,7 @@ class Server {
  private:
   void OnNewConnection(int fd, const std::string& peer);
   void OnMessage(const std::shared_ptr<Connection>& conn, Buffer* buf);
-  void DispatchCommand(const std::shared_ptr<Connection>& conn, const RespValue& cmd);
+  void DispatchCommand(const std::shared_ptr<Connection>& conn, RespValue& cmd);
   void HandleSignalRead();
   void HandleChildExit();  // SIGCHLD 收割 rewrite/bgsave 子进程并收尾
   void HandleAutoRewriteTick();  // timerfd 到期：读空后检查并触发自动 AOF rewrite

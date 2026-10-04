@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 
 #include <string>
 #include <utility>
@@ -52,6 +53,11 @@ void RespParser::Reset() {
   line_.clear();
 }
 
+void RespParser::MaterializeIncomplete() {
+  for (Frame& f : stack_) f.value.Materialize();
+  current_.Materialize();
+}
+
 bool RespParser::Commit(RespValue value, RespValue* out) {
   RespValue cur = std::move(value);
   while (true) {
@@ -76,6 +82,7 @@ ParseResult RespParser::Parse(const char* data, size_t len, size_t* consumed, Re
       case Step::kType: {
         if (pos >= len) {
           *consumed = pos;
+          MaterializeIncomplete();
           return ParseResult::kIncomplete;
         }
         char type = data[pos++];
@@ -119,6 +126,7 @@ ParseResult RespParser::Parse(const char* data, size_t len, size_t* consumed, Re
           pos = len;
           if (line_.size() > kMaxLineLength) return ParseResult::kError;
           *consumed = pos;
+          MaterializeIncomplete();
           return ParseResult::kIncomplete;
         }
         size_t newline = static_cast<const char*>(nl) - data;
@@ -218,15 +226,25 @@ ParseResult RespParser::Parse(const char* data, size_t len, size_t* consumed, Re
       case Step::kBulkBody: {
         size_t avail = len - pos;
         size_t want = static_cast<size_t>(bulk_remaining_);
-        size_t n = (avail < want) ? avail : want;
-        current_.str.append(data + pos, n);
-        pos += n;
-        bulk_remaining_ -= static_cast<int64_t>(n);
-        if (bulk_remaining_ > 0) {
-          *consumed = pos;
-          return ParseResult::kIncomplete;
+        if (avail >= want && current_.str.empty()) {
+          // body 一次性完整落在当前缓冲：存借引用（零拷贝），物化推迟到 Route 拷贝。
+          current_.view = std::string_view(data + pos, want);
+          pos += want;
+          bulk_remaining_ = 0;
+          step_ = Step::kBulkCrlf;
+        } else {
+          // body 跨多次读取（partial）或已部分物化：回退 str.append 物化。
+          size_t n = (avail < want) ? avail : want;
+          current_.str.append(data + pos, n);
+          pos += n;
+          bulk_remaining_ -= static_cast<int64_t>(n);
+          if (bulk_remaining_ > 0) {
+            *consumed = pos;
+            MaterializeIncomplete();
+            return ParseResult::kIncomplete;
+          }
+          step_ = Step::kBulkCrlf;
         }
-        step_ = Step::kBulkCrlf;
         break;
       }
 
@@ -234,6 +252,7 @@ ParseResult RespParser::Parse(const char* data, size_t len, size_t* consumed, Re
         if (len - pos < 2) {
           // trailer 不足 2 字节：不消费，下次从当前位置重查 \r\n。
           *consumed = pos;
+          MaterializeIncomplete();
           return ParseResult::kIncomplete;
         }
         if (data[pos] != '\r' || data[pos + 1] != '\n') return ParseResult::kError;

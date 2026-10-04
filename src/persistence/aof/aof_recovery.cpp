@@ -138,6 +138,8 @@ AofRecoveryResult AofRecovery::Replay(
       return r;
     }
 
+    cmd.Materialize();  // AOF recovery 从文件解析：物化 view 后读 str
+
     std::string name = cmd.array[0].str;
     std::transform(name.begin(), name.end(), name.begin(),
                    [](unsigned char c) { return std::tolower(c); });

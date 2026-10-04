@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "mycache/eviction/eviction_policy.h"
@@ -30,6 +31,8 @@ class CommandRouter {
 
   // 把任务提交到 key 对应的 shard worker（在其线程上执行）。
   void Route(const std::string& key, std::function<void(Shard*)> fn);
+  // 同上，key 以 string_view 传入：解析层的借引用（view）不物化，直接哈希路由。
+  void Route(std::string_view key, std::function<void(Shard*)> fn);
 
   // 把任务提交到指定下标的 shard worker（多 key 命令扇出用）。
   void RouteTo(size_t shard_index, std::function<void(Shard*)> fn);

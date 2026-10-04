@@ -245,7 +245,7 @@ void Server::OnMessage(const std::shared_ptr<Connection>& conn, Buffer* buf) {
   }
 }
 
-void Server::DispatchCommand(const std::shared_ptr<Connection>& conn, const RespValue& cmd) {
+void Server::DispatchCommand(const std::shared_ptr<Connection>& conn, RespValue& cmd) {
   if (cmd.type != RespType::kArray || cmd.array.empty()) {
     conn->Send(EncodeResp(RespValue::Error("ERR Protocol error: expected array of bulk strings")));
     return;
@@ -256,7 +256,9 @@ void Server::DispatchCommand(const std::shared_ptr<Connection>& conn, const Resp
     return;
   }
 
-  std::string name = name_val.str;
+  // 命令名是 bulk string，可能还是借引用（view）：物化成本极小（几个字节）。
+  std::string name = (name_val.view.data() != nullptr) ? std::string(name_val.view)
+                                                       : name_val.str;
   std::transform(name.begin(), name.end(), name.begin(),
                  [](unsigned char c) { return std::tolower(c); });
 
@@ -282,10 +284,14 @@ void Server::DispatchCommand(const std::shared_ptr<Connection>& conn, const Resp
     ctx.config = &config_;
     ctx.router = &router_;
     ctx.pm = &pm_;
+    cmd.Materialize();  // IO 线程直接执行，无 Route 拷贝：显式物化 view，handler 读 str
     command->handler(ctx, cmd.array);
   } else if (command->first_key > 0) {
     // 有 key 的命令：按 key 哈希路由到对应 shard worker，在其线程上执行。
-    const std::string& key = cmd.array[static_cast<size_t>(command->first_key)].str;
+    // key 从 view 直接哈希（不物化）；args = cmd.array 的拷贝构造触发 view→str 物化
+    // —— 别改成 std::move 或引用捕获，view 会逃出 IO 线程悬空。
+    const RespValue& kv = cmd.array[static_cast<size_t>(command->first_key)];
+    std::string_view key = (kv.view.data() != nullptr) ? kv.view : std::string_view(kv.str);
     AofWriter* aof = pm_.aof();
     const Config* cfg = &config_;
     CommandRouter* rt = &router_;
@@ -305,6 +311,7 @@ void Server::DispatchCommand(const std::shared_ptr<Connection>& conn, const Resp
     ctx.config = &config_;
     ctx.router = &router_;
     ctx.pm = &pm_;
+    cmd.Materialize();  // IO 线程直接执行，无 Route 拷贝：显式物化 view
     command->handler(ctx, cmd.array);
   }
 }
