@@ -190,6 +190,7 @@ ParseResult RespParser::Parse(const char* data, size_t len, size_t* consumed, Re
               Frame f;
               f.value.type = RespType::kArray;
               f.remaining = n;
+              f.value.array.reserve(static_cast<size_t>(n));  // 按 ARGV 计数预留，消 push_back 扩容
               stack_.push_back(std::move(f));
               step_ = Step::kType;
             }
