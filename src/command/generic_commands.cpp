@@ -63,7 +63,7 @@ void ExpireCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   int64_t when = UnixMs() + static_cast<int64_t>(seconds) * 1000;
   if (ctx.db->ExpireAt(args[1].str, when)) {
     // 记绝对时间 PEXPIREAT，重放时不受启动时机影响。
-    if (aof::LogCommand(ctx.aof, "PEXPIREAT", {args[1].str, std::to_string(when)}) != 0) {
+    if (aof::LogCommand(ctx.aof, "PEXPIREAT", args[1].str, std::to_string(when)) != 0) {
       ctx.ReplyError("AOF write failed");
       return;
     }
@@ -78,7 +78,7 @@ void PExpireCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   if (!ParseIntArg(ctx, args[2], &ms)) return;
   int64_t when = UnixMs() + static_cast<int64_t>(ms);
   if (ctx.db->ExpireAt(args[1].str, when)) {
-    if (aof::LogCommand(ctx.aof, "PEXPIREAT", {args[1].str, std::to_string(when)}) != 0) {
+    if (aof::LogCommand(ctx.aof, "PEXPIREAT", args[1].str, std::to_string(when)) != 0) {
       ctx.ReplyError("AOF write failed");
       return;
     }

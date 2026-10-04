@@ -62,7 +62,7 @@ void LPopCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   std::string v;
   if (ctx.db->LPop(args[1].str, &v)) {
     // 弹出是破坏性写，记成 LPOP（重放时逐次弹出，效果一致）。
-    if (aof::LogCommand(ctx.aof, "LPOP", {args[1].str}) != 0) {
+    if (aof::LogCommand(ctx.aof, "LPOP", args[1].str) != 0) {
       ctx.ReplyError("AOF write failed");
       return;
     }
@@ -76,7 +76,7 @@ void RPopCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   if (!CheckListType(ctx, args[1].str)) return;
   std::string v;
   if (ctx.db->RPop(args[1].str, &v)) {
-    if (aof::LogCommand(ctx.aof, "RPOP", {args[1].str}) != 0) {
+    if (aof::LogCommand(ctx.aof, "RPOP", args[1].str) != 0) {
       ctx.ReplyError("AOF write failed");
       return;
     }

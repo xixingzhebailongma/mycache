@@ -38,7 +38,7 @@ bool SendAll(int fd, const char* data, size_t len) {
   return true;
 }
 
-// 读精确 n 字节进 out；失败/超时返回 false（2 秒 SO_RCVTIMEO，避免 view 逃逸时挂死）。
+// 读精确 n 字节进 out；失败/超时返回 false（5 秒 SO_RCVTIMEO，避免 view 逃逸时挂死）。
 bool RecvExact(int fd, size_t n, std::string* out) {
   std::vector<char> buf(n);
   size_t got = 0;
@@ -60,7 +60,7 @@ int Connect(int port) {
   if (fd < 0) return -1;
   int one = 1;
   ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-  timeval tv{2, 0};
+  timeval tv{5, 0};
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   sockaddr_in addr{};
   addr.sin_family = AF_INET;

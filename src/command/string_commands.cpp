@@ -31,7 +31,7 @@ void PingCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
 void SetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   if (!EvictOrOom(ctx)) return;
   ctx.db->Set(args[1].str, args[2].str);
-  if (aof::LogCommand(ctx.aof, "SET", {args[1].str, args[2].str}) != 0) {
+  if (aof::LogCommand(ctx.aof, "SET", args[1].str, args[2].str) != 0) {
     ctx.ReplyError("AOF write failed");
     return;
   }
@@ -142,7 +142,7 @@ void MSetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
            for (size_t i : g.indices) {
              shard->Set((*keys)[i], (*values)[i]);
              // 记成逐条 SET：幂等自包含，恢复按首 key 路由正确。
-             if (aof::LogCommand(aof, "SET", {(*keys)[i], (*values)[i]}) != 0) {
+             if (aof::LogCommand(aof, "SET", (*keys)[i], (*values)[i]) != 0) {
                aof_err->store(true, std::memory_order_relaxed);
              }
            }
@@ -188,7 +188,7 @@ void IncrByCommand(CommandContext& ctx, const std::vector<RespValue>& args, long
   // 记成 SET（绝对结果），AOF 重放时结果确定，且不依赖 INCR 的增量语义。
   std::string nv = std::to_string(result);
   ctx.db->Set(args[1].str, nv);
-  if (aof::LogCommand(ctx.aof, "SET", {args[1].str, nv}) != 0) {
+  if (aof::LogCommand(ctx.aof, "SET", args[1].str, nv) != 0) {
     ctx.ReplyError("AOF write failed");
     return;
   }

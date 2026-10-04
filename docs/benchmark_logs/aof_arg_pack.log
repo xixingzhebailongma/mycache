@@ -1,0 +1,10 @@
+# AOF 参数打包修复 —— 变参 LogCommand（null 早退在构造 vector 之前）
+# date: 2026-10-04T21:18:19+08:00
+# 修前: {args[1].str, args[2].str} initializer_list 双重拷贝（临时数组 + vector）
+# 修后: LogCommand(aof, "SET", args[1].str, args[2].str)，null 早退跳过构造
+# 对照: parser_step3_result.log (median 205620963)
+run1 total_Ir=187344986
+run2 total_Ir=187624293
+run3 total_Ir=187379359
+median total_Ir=187379359
+delta = -8.87%  (205620963 -> 187379359)

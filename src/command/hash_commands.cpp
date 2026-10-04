@@ -23,7 +23,7 @@ void HSetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   if (!CheckHashType(ctx, args[1].str)) return;
   if (!EvictOrOom(ctx)) return;
   int added = ctx.db->HSet(args[1].str, args[2].str, args[3].str);
-  if (aof::LogCommand(ctx.aof, "HSET", {args[1].str, args[2].str, args[3].str}) != 0) {
+  if (aof::LogCommand(ctx.aof, "HSET", args[1].str, args[2].str, args[3].str) != 0) {
     ctx.ReplyError("AOF write failed");
     return;
   }

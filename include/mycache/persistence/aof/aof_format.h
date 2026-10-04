@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace mycache {
@@ -35,6 +37,20 @@ std::string EncodeRecord(const std::string& payload);
 // 若 aof 非空，把 name+args 编码为一条记录并追加（AOF 未开启时是空操作）。
 // 返回 0 成功，非 0 = errno（透传 AofWriter::Append）。
 int LogCommand(AofWriter* aof, const std::string& name, const std::vector<std::string>& args);
+
+// 变参模板：接受单个字符串参数（SET/HSET/PEXPIREAT/LPOP/RPOP 等）。null 早退在构造
+// vector 之前——AOF 未开启时避免「把 args 打包成 vector<string>」的浪费（callgrind 实测
+// SET 路径该打包占 ~3% 总指令）。SFINAE 约束每个实参可构造 std::string，把
+// std::vector<std::string> 排除掉，保证 DEL/LPUSH/RPUSH/HDEL 等扇出场景走非模板重载。
+template <typename... Args,
+          std::enable_if_t<(std::is_constructible_v<std::string, Args&&> && ...), int> = 0>
+int LogCommand(AofWriter* aof, const std::string& name, Args&&... strs) {
+  if (aof == nullptr) return 0;
+  std::vector<std::string> v;
+  v.reserve(sizeof...(Args));
+  (v.emplace_back(std::forward<Args>(strs)), ...);
+  return LogCommand(aof, name, v);
+}
 
 }  // namespace aof
 }  // namespace mycache
