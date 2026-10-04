@@ -1,0 +1,36 @@
+# Upgrade 2 callgrind A/B —— memory pool on/off
+# date: 2026-10-04T13:51:13+08:00
+# binary: build-prof/mycache-server (RelWithDebInfo, jemalloc)
+# conf: io_threads 1 / shard_count 1, AOF off, port 6386
+# cmd:   redis-benchmark -p 6386 -t set -n 20000 -c 50 -d 64
+# annotate: callgrind_annotate --inclusive=yes --threshold=99 --show-percs=yes
+
+===== pool off =====
+234,988,938 (100.0%)  PROGRAM TOTALS
+  8,469,986 ( 3.60%)  /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long)
+  8,399,984 ( 3.57%)  src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) [/home/kai/mycache/build-prof/mycache-server]
+  6,961,895 ( 2.96%)  /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*)
+  6,901,892 ( 2.94%)  src/storage/memory/allocator.cpp:mycache::zfree(void*) [/home/kai/mycache/build-prof/mycache-server]
+    111 ( 0.00%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) (1x)
+    112 ( 0.00%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*) (1x)
+    112 ( 0.00%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*) (1x)
+2,306,104 ( 0.98%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) (20,000x)
+1,526,353 ( 0.65%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) (10,000x)
+4,637,418 ( 1.97%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) (40,001x)
+4,635,320 ( 1.97%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*) (40,001x)
+2,326,351 ( 0.99%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*) (20,000x)
+
+===== pool on =====
+233,864,335 (100.0%)  PROGRAM TOTALS
+  7,049,622 ( 3.01%)  /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long)
+  6,909,618 ( 2.95%)  src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) [/home/kai/mycache/build-prof/mycache-server]
+  6,480,314 ( 2.77%)  /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*)
+  6,420,311 ( 2.75%)  src/storage/memory/allocator.cpp:mycache::zfree(void*) [/home/kai/mycache/build-prof/mycache-server]
+3,964,963 ( 1.70%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) (40,001x)
+4,580,095 ( 1.96%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*) (40,001x)
+1,564,615 ( 0.67%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) (20,000x)
+1,519,923 ( 0.65%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) (10,000x)
+1,900,000 ( 0.81%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*) (20,000x)
+    121 ( 0.00%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zmalloc(unsigned long) (1x)
+     95 ( 0.00%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*) (1x)
+    124 ( 0.00%)  => /home/kai/mycache/src/storage/memory/allocator.cpp:mycache::zfree(void*) (1x)

@@ -7,6 +7,7 @@
 #include "mycache/common/logger.h"
 #include "mycache/eviction/lru.h"
 #include "mycache/persistence/snapshot_gate.h"
+#include "mycache/storage/memory/memory_pool.h"
 
 namespace mycache {
 
@@ -22,7 +23,10 @@ ShardWorker::~ShardWorker() { Stop(); }
 
 void ShardWorker::Start() {
   StartActiveExpireTimer();
-  thread_ = std::thread([this] { loop_.Loop(); });
+  thread_ = std::thread([this] {
+    loop_.Loop();
+    mycache::PoolFlushAll();  // Loop() 返回后本线程不再有任何分配，归还空闲池
+  });
 }
 
 void ShardWorker::Stop() {

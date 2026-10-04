@@ -1,0 +1,22 @@
+# Upgrade 2 QPS A/B —— memory pool on/off
+# date:   2026-10-04
+# binary: build-prof/mycache-server (RelWithDebInfo, jemalloc)
+# conf:   io_threads 4 / shard_count 8, no maxmemory, AOF off, port 6388
+# cmd:    redis-benchmark -p 6388 -t set,get -n 200000 -c 50 -d 64 --csv
+# 方法:   同一二进制、交替跑，MYCACHE_DISABLE_POOL=1 (off) vs 默认 (on)，各 3 次取中位
+
+## pool OFF (MYCACHE_DISABLE_POOL=1)
+run1  SET=111482.72  GET=97943.19
+run2  SET=100908.17  GET=107238.60
+run3  SET=101419.88  GET=103412.62
+median  SET=101419.88  GET=103412.62
+
+## pool ON (default)
+run1  SET=108108.11  GET=103573.28
+run2  SET=105932.20  GET=112422.70
+run3  SET=97228.98   GET=100200.40
+median  SET=105932.20  GET=103573.28
+
+## delta (median)
+SET  +4.4%   (101419.88 -> 105932.20)   # 单次方差 ~10%，软信号
+GET  +0.16%  (103412.62 -> 103573.28)   # 噪声

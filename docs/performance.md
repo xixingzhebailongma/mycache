@@ -131,6 +131,10 @@ shard 消除的是「全局 Keyspace 锁 + 多 key 命令并行扇出 + 淘汰�
 `malloc_usable_size`（每次 alloc 与 free 都调一次）。可优化（未改）：仿 Redis `zmalloc`
 把 usable size 存进分配块头部（`PREFIX_SIZE`），预计砍掉热路径 ~7–10% 指令。
 
+> 该方向已在 **Upgrade 2 以 size-class 池化实现**（见 §10）：实测 allocator 路径指令占比
+> 下降 0.78 pp（6.56% → 5.78%），**未达当初 ~7–10% 的乐观预估**——jemalloc 本身已有
+> tcache，且池碰不到 std 容器的 `operator new/delete`（占分配簇大头）。
+
 ### 6.3 AOF 写路径
 
 - `AofWriter` 互斥锁是唯一明显的写路径争用点：8 个 shard 往一个 writer 追加，`Append`
@@ -160,7 +164,8 @@ TSan 在 Linux 6.x 高熵 ASLR 下需 `setarch $(uname -m) -R` 关 ASLR 再跑�
 ## 9. 原始日志与复现
 
 **原始日志**：`docs/benchmark_logs/`（20 个文件，5 档配置 × 4 种压测，完整原始输出，
-命名 `<bench>_io<io>_shard<shard>.log`）。本文所有表格数字可直接在对应日志里核对。
+命名 `<bench>_io<io>_shard<shard>.log`；Upgrade 2 的 A/B 见 `upgrade2_qps_ab.log` 与
+`upgrade2_callgrind_ab.log`）。本文所有表格数字可直接在对应日志里核对。
 
 **一键复现**：`scripts/bench_sweep.sh`（对 5 档配置依次跑 4 种压测并落盘日志）：
 
@@ -172,3 +177,46 @@ cmake --build build -j"$(nproc)"   # 或从零：rm -rf build && cmake -B build 
 > **关于数字波动**：WSL2 上绝对吞吐随 CPU 频率/宿主负载在数倍范围内漂移（同一 sweep 内部
 > 相对结论稳定，跨时段跑出的绝对值可能差 2–8 倍）。因此**跨版本对比只认同一批日志里的
 > 相对关系**，单次绝对值仅供量级参考。复现时以 `docs/benchmark_logs/` 当次输出为准。
+
+## 10. Upgrade 2：zmalloc/zfree 层 size-class 池化
+
+在 `zmalloc/zfree` 层对小对象（≤4096B）做 size-class 池化，省掉 `malloc/free/
+malloc_usable_size` 簿记。设计见 `docs/memory-pool.md`。A/B 用同一二进制运行时切换：
+`MYCACHE_DISABLE_POOL=1` 关池（=改动前口径），默认开池。
+
+### 10.1 callgrind 指令占比 A/B（主口径）
+
+同二进制、同 conf（`io_threads 1` / `shard_count 1`，AOF off）、同负载
+`redis-benchmark -t set -n 20000 -c 50 -d 64`：
+
+| 指标 | pool OFF | pool ON | Δ |
+|------|----------|---------|----|
+| 总指令 Ir | 234,988,938 | 233,864,335 | −0.48% |
+| `zmalloc` inclusive | 3.60% | 3.01% | −0.59 pp |
+| `zfree` inclusive | 2.96% | 2.77% | −0.19 pp |
+| **allocator 路径合计** | **6.56%** | **5.78%** | **−0.78 pp（相对自身 −12%）** |
+
+原始日志：`docs/benchmark_logs/upgrade2_callgrind_ab.log`。
+
+### 10.2 QPS A/B（辅口径，软信号）
+
+同二进制、`io_threads 4` / `shard_count 8`、`redis-benchmark -t set,get -n 200000 -c 50 -d 64`，
+各 3 次取中位：
+
+| 命令 | pool OFF | pool ON | Δ |
+|------|----------|---------|----|
+| SET | 101,420 | 105,932 | +4.4%（单次方差 ~10%，软信号） |
+| GET | 103,413 | 103,573 | ~0（噪声） |
+
+原始日志：`docs/benchmark_logs/upgrade2_qps_ab.log`。
+
+### 10.3 诚实结论
+
+- 池 ROI 上限 ~5.7%（`zmalloc+zfree` inclusive），实得 **0.78 pp** 总指令占比下降。
+- QPS SET +4.4% 但方差 ~10%，**不写进简历**，仅 docs 留档。
+- `malloc_usable_size`（~2.23%）是池能消的最大单项，但池自身开销（magic 校验 +
+  freelist push/pop）吃掉一部分，净得 0.78 pp。
+
+简历 bullet（锁定，不改）：
+> 在 zmalloc/zfree 层做 size-class 池化，allocator 路径指令占比从 6.56% 降到 5.78%
+> （相对降低 ~12%），总指令数减少 ~0.5%。
