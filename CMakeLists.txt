@@ -78,8 +78,13 @@ if(MYCACHE_BUILD_TESTS)
     tests/unit/list_test.cpp
     tests/unit/info_test.cpp
     tests/unit/multi_key_test.cpp
-    tests/unit/week6_test.cpp)
+    tests/unit/week6_test.cpp
+    tests/unit/keyed_view_test.cpp)
   target_link_libraries(mycache_tests PRIVATE mycache_core GTest::gtest GTest::gtest_main)
+  # keyed_view_test 起真实 server 子进程：注入 server 二进制路径 + 保证先构建。
+  target_compile_definitions(mycache_tests PRIVATE
+    MYCACHE_SERVER_PATH="${CMAKE_BINARY_DIR}/mycache-server")
+  add_dependencies(mycache_tests mycache-server)
   add_test(NAME mycache_tests COMMAND mycache_tests)
 endif()
 
