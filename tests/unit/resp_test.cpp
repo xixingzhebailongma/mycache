@@ -19,6 +19,14 @@ void ExpectParse(const std::string& input, RespValue* out) {
   EXPECT_EQ(consumed, input.size());
 }
 
+// 断言输入触发协议错误（kError），不产生 UB、不崩溃。
+void ExpectError(const std::string& input) {
+  RespParser p;
+  size_t consumed = 0;
+  RespValue v;
+  EXPECT_EQ(p.Parse(input.data(), input.size(), &consumed, &v), ParseResult::kError);
+}
+
 // 把一条完整 RESP 串按 chunk 大小分片，逐片喂入一个 Buffer（模拟连接缓冲累积），
 // 驱动解析器直到产出完整命令。chunk 任意切法（含 trailer 被拆到两次喂入）都应成功。
 RespValue StreamParse(const std::string& data, size_t chunk) {
@@ -79,6 +87,43 @@ TEST(RespParserTest, EmptyBulk) {
 }
 
 TEST(RespParserTest, NullBulk) {
+  RespValue v;
+  ExpectParse("$-1\r\n", &v);
+  EXPECT_TRUE(v.IsNull());
+}
+
+// ---- 手写整数解析的边界（信任基础）----
+// 覆盖溢出/非数字/空长度/超长数字，与 strtoll 行为一致：返回 kError 而非 UB。
+
+TEST(RespParserTest, IntParseBulkLengthOverflow) {
+  // 2^63 溢出 int64：返回 kError 而非 UB。
+  ExpectError("$9223372036854775808\r\n");
+  // 负方向溢出（|n| > 2^63）：同样 kError，与 $-1 的 null 语义区分开。
+  ExpectError("$-9223372036854775809\r\n");
+}
+
+TEST(RespParserTest, IntParseArrayCountOverflow) {
+  ExpectError("*99999999999999999999\r\n");
+}
+
+TEST(RespParserTest, IntParseNonDigit) {
+  ExpectError("$abc\r\n");
+  ExpectError("*12x\r\n");
+}
+
+TEST(RespParserTest, IntParseEmptyLengthLine) {
+  // '$'/'*' 后直接 \r\n，长度行无数字 → 错误。
+  ExpectError("$\r\n");
+  ExpectError("*\r\n");
+}
+
+TEST(RespParserTest, IntParseHundredDigitString) {
+  std::string digits(100, '9');
+  ExpectError("$" + digits + "\r\n");
+}
+
+TEST(RespParserTest, NullBulkIsNotOverflow) {
+  // $-1 是合法 null bulk，手写解析必须把它与「数字溢出」区分开。
   RespValue v;
   ExpectParse("$-1\r\n", &v);
   EXPECT_TRUE(v.IsNull());
