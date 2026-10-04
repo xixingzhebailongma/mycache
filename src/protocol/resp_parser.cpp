@@ -1,7 +1,6 @@
 #include "mycache/protocol/resp_parser.h"
 
-#include <cerrno>
-#include <cstdlib>
+#include <cstdint>
 #include <cstring>
 
 #include <string>
@@ -17,12 +16,28 @@ constexpr int kMaxNestingDepth = 128;         // 嵌套深度上限，超限视�
 constexpr size_t kMaxLineLength = 64 * 1024;  // 行长度上限，防无 '\n' 时无限增长
 
 bool ParseInt64(const std::string& s, int64_t* out) {
+  // 手写十进制解析替代 strtoll：RESP 数字格式规整（可选 +/- 号 + 纯数字，无空白前缀），
+  // strtoll 的主要开销在线程 locale 查找，手写循环可跳过。
   if (s.empty()) return false;
-  errno = 0;
-  char* end = nullptr;
-  long long v = std::strtoll(s.c_str(), &end, 10);
-  if (errno != 0 || end == s.c_str() || *end != '\0') return false;
-  *out = static_cast<int64_t>(v);
+  size_t i = 0;
+  bool neg = false;
+  if (s[i] == '-' || s[i] == '+') {
+    neg = (s[i] == '-');
+    if (++i == s.size()) return false;  // 只有符号位
+  }
+  uint64_t acc = 0;
+  const uint64_t limit = neg ? static_cast<uint64_t>(INT64_MAX) + 1u
+                             : static_cast<uint64_t>(INT64_MAX);
+  for (; i < s.size(); ++i) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    if (c < '0' || c > '9') return false;  // 非数字：与 strtoll 尾字符检查一致，返回 false
+    uint64_t d = static_cast<uint64_t>(c - '0');
+    if (acc > (limit - d) / 10) return false;  // 溢出：与 strtoll ERANGE 一致，返回 false
+    acc = acc * 10 + d;
+  }
+  *out = neg ? (acc == static_cast<uint64_t>(INT64_MAX) + 1u ? INT64_MIN
+                                                             : -static_cast<int64_t>(acc))
+             : static_cast<int64_t>(acc);
   return true;
 }
 
