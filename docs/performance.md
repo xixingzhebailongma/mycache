@@ -220,3 +220,47 @@ malloc_usable_size` 簿记。设计见 `docs/memory-pool.md`。A/B 用同一二�
 简历 bullet（锁定，不改）：
 > 在 zmalloc/zfree 层做 size-class 池化，allocator 路径指令占比从 6.56% 降到 5.78%
 > （相对降低 ~12%），总指令数减少 ~0.5%。
+
+## 11. Upgrade 3：RESP 解析零拷贝（parser 战役）
+
+用 callgrind 拆热点：`RespParser::Parse` inclusive 32.6% 但 **self 只有 ~4%**（大头是
+std::string 物化 + vector 扩容 + memcpy）；`std::function` 那 27% 里类型擦除仅 ~1.5%，
+真身是它调用的 `SetCommand` 25.76%。结论：先打 RESP 表示层，不动这两个函数本体。
+
+三步，每步单独 commit + A/B（conf `io_threads 1` / `shard_count 1`、`SET -n 20000 -c 50
+-d 64`）：
+
+| 步骤 | commit | 改动 | Δ 总 Ir |
+|---|---|---|---|
+| Step 1 | `eec8172` | `vector<RespValue>` 按 ARGV 计数 reserve | −5.4%（单次） |
+| Step 2 | `cde105f` | 手写 int64 解析替代 strtoll | −3.8%（单次） |
+| Step 3 | `82e836f` | bulk string 零拷贝（view 延迟物化） | −3.58%（3 次中位） |
+
+原始日志：Step 3 基线 `docs/benchmark_logs/parser_step3_baseline.log`、结果
+`parser_step3_result.log`（Step 1/2 为单次 run 方差大，Step 3 为 3 次中位）。
+
+### 11.1 实测抓到的 bug：view 跨 readFd 悬空
+
+零拷贝让 `RespParser` 把 bulk string 存成 `(ptr,len)` 借引用，物化推迟到 Route 拷贝。
+但 **view 也会存进 parser 的持久状态 `stack_`**——命令跨 `readFd` 拆分（大 value > 缓冲）
+时，前几个已提交元素的 view 在下次 `readFd` 触发 `ensureWritable` 的 `resize`/`memmove`
+后悬空，读到垃圾。
+
+这是**同线程跨 readFd** 的生命周期 bug，不是「跨线程 RunInLoop」那类。纸面推导
+（「view 只活在 OnMessage 调用栈内」）漏了 `stack_` 跨 OnMessage 持久这一层——靠
+`LargeArrayStreaming` 测试实测抓到，比推导硬。
+
+修法：每个 `kIncomplete` 返回点前 `MaterializeIncomplete()`（物化 `stack_` + `current_`），
+只作用于 split 命令；完整命令仍零拷贝，保住大头。
+
+### 11.2 累计与口径
+
+- 分配（内存池，§10）−0.48% + 解析三步，相乘累计 **−12.5% 总指令 Ir**（相对
+  pool-off 起点 234,988,938 → Step 3 的 205,620,963）。**这是 callgrind 总指令口径，
+  不是 QPS**。
+- QPS 在 WSL2 单次方差 ~10%，不作为主口径。
+
+简历 bullet（锁定，不改）：
+> 用 callgrind 拆解 RESP 解析 inclusive vs self 热点，通过 vector reserve、手写整数
+> 解析、bulk string 零拷贝（view 延迟物化 + 跨 readFd 回退）三步，请求路径总指令数
+> 累计下降 12.5%。
