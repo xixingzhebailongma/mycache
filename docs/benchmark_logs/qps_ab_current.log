@@ -1,0 +1,24 @@
+=== current run1 get_set ===
+single-connection round-trip benchmark: host=127.0.0.1 port=6388 nreq=20000 value=64B
+SET  QPS=   10286  P50=  0.086ms  P99=  0.246ms
+GET  QPS=   10705  P50=  0.085ms  P99=  0.197ms
+=== current run1 concurrency ===
+concurrency benchmark: host=127.0.0.1 port=6388 conns=50 threads=50 per_conn=4000 value=64B (total per phase=200000)
+SET  QPS=   92592  P50=  0.478ms  P99=  1.285ms  (n=200000)
+GET  QPS=  102037  P50=  0.437ms  P99=  1.166ms  (n=200000)
+=== current run2 get_set ===
+single-connection round-trip benchmark: host=127.0.0.1 port=6388 nreq=20000 value=64B
+SET  QPS=   13654  P50=  0.065ms  P99=  0.154ms
+GET  QPS=   12399  P50=  0.071ms  P99=  0.171ms
+=== current run2 concurrency ===
+concurrency benchmark: host=127.0.0.1 port=6388 conns=50 threads=50 per_conn=4000 value=64B (total per phase=200000)
+SET  QPS=   90411  P50=  0.484ms  P99=  1.328ms  (n=200000)
+GET  QPS=  105004  P50=  0.426ms  P99=  1.111ms  (n=200000)
+=== current run3 get_set ===
+single-connection round-trip benchmark: host=127.0.0.1 port=6388 nreq=20000 value=64B
+SET  QPS=   14263  P50=  0.063ms  P99=  0.144ms
+GET  QPS=   13203  P50=  0.067ms  P99=  0.162ms
+=== current run3 concurrency ===
+concurrency benchmark: host=127.0.0.1 port=6388 conns=50 threads=50 per_conn=4000 value=64B (total per phase=200000)
+SET  QPS=  108872  P50=  0.420ms  P99=  0.952ms  (n=200000)
+GET  QPS=  105185  P50=  0.426ms  P99=  1.131ms  (n=200000)
