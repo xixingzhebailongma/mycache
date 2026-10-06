@@ -35,6 +35,8 @@ void ExistsCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   auto groups = GroupKeysByShard(*ctx.router, *keys);
   auto total = std::make_shared<std::atomic<int64_t>>(0);
   std::shared_ptr<Connection> conn = ctx.conn;
+  uint64_t seq = ctx.seq;
+  std::string name = ctx.name;
 
   FanOut(ctx.router, groups,
          [keys, total](Shard* shard, const KeyGroup& g) {
@@ -51,8 +53,8 @@ void ExistsCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
            }
            total->fetch_add(n, std::memory_order_relaxed);
          },
-         [conn, total]() {
-           conn->Send(EncodeResp(
+         [conn, total, seq, name]() {
+           conn->Send(seq, name, EncodeResp(
                RespValue::Integer(total->load(std::memory_order_relaxed))));
          });
 }
@@ -97,7 +99,7 @@ void TtlCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
 }  // namespace
 
 void RegisterGenericCommands(CommandTable* table) {
-  table->Register(Command{"exists", -2, 1, ExistsCommand, -1, 1});
+  table->Register(Command{"exists", -2, 1, ExistsCommand, -1, 1, true});
   table->Register(Command{"expire", 3, 1, ExpireCommand});
   table->Register(Command{"pexpire", 3, 1, PExpireCommand});
   table->Register(Command{"ttl", 2, 1, TtlCommand});

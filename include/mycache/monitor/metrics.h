@@ -18,6 +18,7 @@ class Metrics {
   void IncrConnections() { connections_.fetch_add(1, std::memory_order_relaxed); }
   void IncrConnected() { connected_clients_.fetch_add(1, std::memory_order_relaxed); }
   void DecrConnected() { connected_clients_.fetch_sub(1, std::memory_order_relaxed); }
+  void IncrStaleReplies() { stale_replies_.fetch_add(1, std::memory_order_relaxed); }
 
   uint64_t hits() const { return hits_.load(std::memory_order_relaxed); }
   uint64_t misses() const { return misses_.load(std::memory_order_relaxed); }
@@ -26,6 +27,7 @@ class Metrics {
   uint64_t commands() const { return commands_.load(std::memory_order_relaxed); }
   uint64_t connections() const { return connections_.load(std::memory_order_relaxed); }
   uint64_t connected_clients() const { return connected_clients_.load(std::memory_order_relaxed); }
+  uint64_t stale_replies() const { return stale_replies_.load(std::memory_order_relaxed); }
 
   // 记录进程启动时刻（幂等），用于计算 uptime（基于单调钟）。
   void MarkStart();
@@ -41,6 +43,7 @@ class Metrics {
   std::atomic<uint64_t> commands_{0};
   std::atomic<uint64_t> connections_{0};
   std::atomic<uint64_t> connected_clients_{0};
+  std::atomic<uint64_t> stale_replies_{0};
   std::atomic<int64_t> start_ms_{0};
 };
 

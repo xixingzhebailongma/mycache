@@ -236,7 +236,7 @@ void Server::OnMessage(const std::shared_ptr<Connection>& conn, Buffer* buf) {
       return;
     }
     if (r == ParseResult::kError) {
-      conn->Send(EncodeResp(RespValue::Error("ERR Protocol error: invalid multibulk length")));
+      conn->SendFatal(EncodeResp(RespValue::Error("ERR Protocol error: invalid multibulk length")));
       conn->Shutdown();
       return;
     }
@@ -246,13 +246,15 @@ void Server::OnMessage(const std::shared_ptr<Connection>& conn, Buffer* buf) {
 }
 
 void Server::DispatchCommand(const std::shared_ptr<Connection>& conn, RespValue& cmd) {
+  const uint64_t seq = conn->NextCmdSeq();
+
   if (cmd.type != RespType::kArray || cmd.array.empty()) {
-    conn->Send(EncodeResp(RespValue::Error("ERR Protocol error: expected array of bulk strings")));
+    conn->Send(seq, "", EncodeResp(RespValue::Error("ERR Protocol error: expected array of bulk strings")));
     return;
   }
   const RespValue& name_val = cmd.array[0];
   if (name_val.type != RespType::kBulkString) {
-    conn->Send(EncodeResp(RespValue::Error("ERR Protocol error: command name must be a bulk string")));
+    conn->Send(seq, "", EncodeResp(RespValue::Error("ERR Protocol error: command name must be a bulk string")));
     return;
   }
 
@@ -264,13 +266,13 @@ void Server::DispatchCommand(const std::shared_ptr<Connection>& conn, RespValue&
 
   const Command* command = command_table_.Find(name);
   if (!command) {
-    conn->Send(EncodeResp(RespValue::Error("ERR unknown command '" + name + "'")));
+    conn->Send(seq, name, EncodeResp(RespValue::Error("ERR unknown command '" + name + "'")));
     return;
   }
 
   std::string arity_err;
   if (!CommandTable::CheckArity(*command, cmd.array.size(), &arity_err)) {
-    conn->Send(EncodeResp(RespValue::Error(arity_err)));
+    conn->Send(seq, name, EncodeResp(RespValue::Error(arity_err)));
     return;
   }
 
@@ -280,6 +282,8 @@ void Server::DispatchCommand(const std::shared_ptr<Connection>& conn, RespValue&
     // 多 key 命令（DEL/EXISTS/MGET/MSET）：在 IO 线程执行，handler 内部按 shard
     // 分组扇出，异步汇总后回包。ctx.db 置空（handler 用 ctx.router 触达各 shard）。
     CommandContext ctx{conn, nullptr};
+    ctx.seq = seq;
+    ctx.name = name;
     ctx.aof = pm_.aof();
     ctx.config = &config_;
     ctx.router = &router_;
@@ -296,23 +300,36 @@ void Server::DispatchCommand(const std::shared_ptr<Connection>& conn, RespValue&
     const Config* cfg = &config_;
     CommandRouter* rt = &router_;
     PersistenceManager* pm = &pm_;
-    router_.Route(key, [conn, handler = command->handler, args = cmd.array, aof, cfg, rt, pm](Shard* shard) {
+    const bool async = command->async_reply;  // 此分支恒 false；显式排除 async handler
+    router_.Route(key, [conn, handler = command->handler, args = cmd.array, aof, cfg, rt, pm, seq, name, async](Shard* shard) {
       CommandContext ctx{conn, shard};
+      ctx.seq = seq;
+      ctx.name = name;
       ctx.aof = aof;
       ctx.config = cfg;
       ctx.router = rt;
       ctx.pm = pm;
+      bool replied = false;
+      ctx.replied = &replied;
       handler(ctx, args);
+      if (!async && !replied)
+        conn->Send(seq, name, EncodeResp(RespValue::Error("ERR internal: command produced no reply")));
     });
   } else {
     // 无 key 的命令（PING/ECHO/INFO）：在 IO 线程直接执行。
     CommandContext ctx{conn, nullptr};
+    ctx.seq = seq;
+    ctx.name = name;
     ctx.aof = pm_.aof();
     ctx.config = &config_;
     ctx.router = &router_;
     ctx.pm = &pm_;
     cmd.Materialize();  // IO 线程直接执行，无 Route 拷贝：显式物化 view
+    bool replied = false;
+    ctx.replied = &replied;
     command->handler(ctx, cmd.array);
+    if (!command->async_reply && !replied)
+      conn->Send(seq, name, EncodeResp(RespValue::Error("ERR internal: command produced no reply")));
   }
 }
 

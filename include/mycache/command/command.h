@@ -25,6 +25,10 @@ struct Command {
   // key_step 为相邻 key 的下标差（MSET 的 key/value 交替，为 2）。
   int last_key = 0;
   int key_step = 1;
+  // 回复的“完成路径”是否异步：为真表示正常路径由 FanOut 的 finish 异步回包，dispatch
+  // 跳过“handler 返回未回复”的同步兜底。注意：为真时 handler 仍可能有同步早退路径
+  // （如 MSET 的奇偶校验）直接 ctx.Reply 同步回；只是不能用同步兜底去判它。
+  bool async_reply = false;
 };
 
 // 注册各阶段命令。

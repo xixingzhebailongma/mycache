@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -24,7 +26,15 @@ class Connection : public std::enable_shared_from_this<Connection> {
   // 注册通道并开始读取。必须在循环线程上执行。
   void Establish();
 
-  void Send(const std::string& data);
+  // 分配下一条命令的解析序号（仅 DispatchCommand 在解析线程按命令序调用）。
+  uint64_t NextCmdSeq() { return next_cmd_seq_++; }
+
+  // 有序发送回复：seq=命令解析序号，name=命令名（仅诊断用）。跨线程安全。
+  void Send(uint64_t seq, const std::string& name, const std::string& data);
+
+  // 致命协议错误：仅 loop 线程调用，绕过重排序缓冲直接入 output_。不参与 seq/
+  // pending 计数，也不受 pending 字节 cap 约束（连接即将 Shutdown，无需限制）。
+  void SendFatal(const std::string& data);
   // 优雅关闭：先将输出缓冲区刷出，再关闭连接。
   void Shutdown();
 
@@ -45,7 +55,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
   void HandleError();
 
  private:
-  void SendInLoop(const std::string& data);
+  void SendInLoop(uint64_t seq, const std::string& name, const std::string& data);
   void ShutdownInLoop();
 
   EventLoop* loop_;
@@ -60,6 +70,14 @@ class Connection : public std::enable_shared_from_this<Connection> {
   CloseCallback close_cb_;
   WriteCompleteCallback write_complete_cb_;
   bool closing_ = false;
+
+  // 回复有序性：next_cmd_seq_ 仅解析线程写；next_reply_seq_/pending_replies_/
+  // pending_bytes_ 仅 loop 线程（SendInLoop）读写，无锁安全。
+  uint64_t next_cmd_seq_ = 0;
+  uint64_t next_reply_seq_ = 0;
+  struct PendingReply { std::string name; std::string data; };
+  std::map<uint64_t, PendingReply> pending_replies_;
+  size_t pending_bytes_ = 0;
 };
 
 }  // namespace mycache

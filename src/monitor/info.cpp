@@ -110,6 +110,8 @@ std::string BuildInfo(const Config& config, const CommandRouter& router) {
                      static_cast<unsigned long long>(Metrics::Instance().expired()));
   n += std::snprintf(buf + n, sizeof(buf) - n, "evicted_keys:%llu\r\n",
                      static_cast<unsigned long long>(Metrics::Instance().evicted()));
+  n += std::snprintf(buf + n, sizeof(buf) - n, "stale_replies:%llu\r\n",
+                     static_cast<unsigned long long>(Metrics::Instance().stale_replies()));
   n += std::snprintf(buf + n, sizeof(buf) - n, "\r\n# Keyspace\r\n");
   n += std::snprintf(buf + n, sizeof(buf) - n, "db0:keys=%zu,expires=%zu\r\n", total_keys, total_expires);
 

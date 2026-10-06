@@ -24,6 +24,17 @@ enum class AofFsync { kAlways, kEverysec, kNo };
 // 所有 shard worker 线程共享同一个 AofWriter，并发追加由内部互斥锁串行化，
 // 因此多条记录不会交错。三种策略都保证每条记录在返回前已经 write() 到内核页缓存
 // （进程被 kill -9 后仍存活）；差异只在于 fsync 的时机，即对断电/宕机的持久性。
+//
+// 顺序不变量（与网络层耦合，改动前必读）：
+//  1. 客户端回复序由 Connection 的 reorder buffer 强制成命令解析序（connection.cpp
+//     SendInLoop），与本文件的追加序相互独立。
+//  2. AOF 追加序是 worker 完成序：跨 shard 命令谁先拿到 mu_ 谁先写，不对齐解析序/回复序。
+//     跨 shard 顺序对重放无影响（重放按 key 路由到各自 shard）。
+//  3. ack-after-fsync 由「单条命令内 LogCommand（write+fsync）先于 ctx.Reply」保证，
+//     不依赖任何跨命令顺序；reorder buffer 只延迟回复、不提前回复。
+//  4. 引入 MULTI/EXEC 时，第 2 条的「AOF 追加序 ≠ 回复序」解耦失效：MULTI 要求跨命令
+//     原子性与顺序，追加序必须与命令序对齐。但第 3 条的 ack-after-fsync 不受影响——
+//     它只依赖单命令内 LogCommand 先于 Reply。
 class AofWriter {
  public:
   // io 为空时在 Open 里回退为内部持有的 PosixIO（方便单测直接构造）。

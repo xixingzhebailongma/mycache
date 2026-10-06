@@ -58,6 +58,8 @@ void DelCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   auto total = std::make_shared<std::atomic<int64_t>>(0);
   auto aof_err = std::make_shared<std::atomic<bool>>(false);
   std::shared_ptr<Connection> conn = ctx.conn;
+  uint64_t seq = ctx.seq;
+  std::string name = ctx.name;  // 拷贝：finish 异步执行，ctx 已析构
   AofWriter* aof = ctx.aof;
 
   FanOut(ctx.router, groups,
@@ -73,11 +75,11 @@ void DelCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
            }
            total->fetch_add(removed, std::memory_order_relaxed);
          },
-         [conn, total, aof_err]() {
+         [conn, total, aof_err, seq, name]() {
            if (aof_err->load(std::memory_order_relaxed)) {
-             conn->Send(EncodeResp(RespValue::Error("AOF write failed")));
+             conn->Send(seq, name, EncodeResp(RespValue::Error("AOF write failed")));
            } else {
-             conn->Send(EncodeResp(
+             conn->Send(seq, name, EncodeResp(
                  RespValue::Integer(total->load(std::memory_order_relaxed))));
            }
          });
@@ -92,6 +94,8 @@ void MGetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   auto results = std::make_shared<std::vector<RespValue>>(n);  // 默认 kNull
   auto groups = GroupKeysByShard(*ctx.router, *keys);
   std::shared_ptr<Connection> conn = ctx.conn;
+  uint64_t seq = ctx.seq;
+  std::string name = ctx.name;
 
   FanOut(ctx.router, groups,
          [keys, results](Shard* shard, const KeyGroup& g) {
@@ -106,8 +110,8 @@ void MGetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
              }
            }
          },
-         [conn, results]() {
-           conn->Send(EncodeResp(RespValue::Array(*results)));
+         [conn, results, seq, name]() {
+           conn->Send(seq, name, EncodeResp(RespValue::Array(*results)));
          });
 }
 
@@ -130,6 +134,8 @@ void MSetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
   auto oom = std::make_shared<std::atomic<bool>>(false);
   auto aof_err = std::make_shared<std::atomic<bool>>(false);
   std::shared_ptr<Connection> conn = ctx.conn;
+  uint64_t seq = ctx.seq;
+  std::string name = ctx.name;
   AofWriter* aof = ctx.aof;
 
   FanOut(ctx.router, groups,
@@ -147,14 +153,14 @@ void MSetCommand(CommandContext& ctx, const std::vector<RespValue>& args) {
              }
            }
          },
-         [conn, oom, aof_err]() {
+         [conn, oom, aof_err, seq, name]() {
            if (oom->load(std::memory_order_relaxed)) {
-             conn->Send(EncodeResp(RespValue::Error(
+             conn->Send(seq, name, EncodeResp(RespValue::Error(
                  "OOM command not allowed when used memory > 'maxmemory'")));
            } else if (aof_err->load(std::memory_order_relaxed)) {
-             conn->Send(EncodeResp(RespValue::Error("AOF write failed")));
+             conn->Send(seq, name, EncodeResp(RespValue::Error("AOF write failed")));
            } else {
-             conn->Send(EncodeResp(RespValue::Simple("OK")));
+             conn->Send(seq, name, EncodeResp(RespValue::Simple("OK")));
            }
          });
 }
@@ -227,9 +233,9 @@ void RegisterStringCommands(CommandTable* table) {
   table->Register(Command{"ping", -1, 0, PingCommand});
   table->Register(Command{"set", 3, 1, SetCommand});
   table->Register(Command{"get", 2, 1, GetCommand});
-  table->Register(Command{"del", -2, 1, DelCommand, -1, 1});
-  table->Register(Command{"mget", -2, 1, MGetCommand, -1, 1});
-  table->Register(Command{"mset", -3, 1, MSetCommand, -1, 2});
+  table->Register(Command{"del", -2, 1, DelCommand, -1, 1, true});
+  table->Register(Command{"mget", -2, 1, MGetCommand, -1, 1, true});
+  table->Register(Command{"mset", -3, 1, MSetCommand, -1, 2, true});
   table->Register(Command{"echo", 2, 0, EchoCommand});
   table->Register(Command{"incr", 2, 1, IncrCommand});
   table->Register(Command{"decr", 2, 1, DecrCommand});

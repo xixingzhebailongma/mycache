@@ -1,10 +1,19 @@
 #include "mycache/command/command_table.h"
 
 #include <cstdio>
+#include <cstdlib>
+
+#include "mycache/common/logger.h"
 
 namespace mycache {
 
 void CommandTable::Register(const Command& cmd) {
+  // 启动自检：async_reply 命令必须 last_key != 0（走多 key 分支、finish 异步回包）。
+  // 漏填 last_key 会把它落到同步分支，被“未回复”兜底误判。程序员错误，fail fast。
+  if (cmd.async_reply && cmd.last_key == 0) {
+    LOG_FATAL("command '%s': async_reply requires last_key != 0", cmd.name.c_str());
+    std::exit(1);  // exit 走 atexit/stdio flush，日志能看到；abort 会 SIGABRT+core
+  }
   commands_[cmd.name] = cmd;
 }
 

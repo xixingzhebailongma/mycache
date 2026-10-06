@@ -25,8 +25,14 @@ struct CommandContext {
   const Config* config = nullptr; // 无 key 命令（如 INFO）读取全局配置
   CommandRouter* router = nullptr; // 无 key 命令聚合各 shard 统计
   PersistenceManager* pm = nullptr; // 持久化协调器（BGREWRITEAOF/SAVE/BGSAVE 用）
+  uint64_t seq = 0;                 // 命令解析序号，Reply 用它保证回复有序
+  std::string name{};               // 命令名（小写，诊断用）
+  bool* replied = nullptr;          // 非空时 Reply 置位，供“handler 未回复”检测
 
-  void Reply(const RespValue& v) const { conn->Send(EncodeResp(v)); }
+  void Reply(const RespValue& v) const {
+    if (replied) *replied = true;
+    conn->Send(seq, name, EncodeResp(v));
+  }
   void ReplySimple(const std::string& s) const { Reply(RespValue::Simple(s)); }
   void ReplyBulk(const std::string& s) const { Reply(RespValue::Bulk(s)); }
   void ReplyInt(int64_t n) const { Reply(RespValue::Integer(n)); }
