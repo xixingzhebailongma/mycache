@@ -27,3 +27,16 @@ compile_commands.json
 *.rdb
 # 但 benchmark 原始压测日志要入库（docs/benchmark_logs/ 是性能报告的原始证据）。
 !docs/benchmark_logs/*.log
+
+# Markdown 文档（个人笔记/面试资料：只保留在本地，不入库）
+# 白名单：以下技术文档是作品集内容，继续公开跟踪
+*.md
+!README.md
+!docs/architecture.md
+!docs/design.md
+!docs/eviction.md
+!docs/persistence.md
+!docs/benchmark.md
+!docs/benchmark-week7.md
+!docs/demo.md
+!docs/benchmark_logs/README.md
