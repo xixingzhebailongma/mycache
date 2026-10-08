@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -26,6 +27,7 @@
 #include <deque>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <thread>
@@ -49,6 +51,9 @@ constexpr int kStrings = 64, kHashes = 2, kHashFields = 8, kLists = 2;
 constexpr int kRewriteBulkKeys = 8;
 constexpr int kRewriteBulkBytes = 8192;
 constexpr int kConcurrentThreads = 4;
+// fd 继承测试：写足量数据拉长子进程写盘窗口，方便在 child 退出前 SIGSTOP 抓到。
+constexpr int kFdCheckBulkKeys = 16;
+constexpr int kFdCheckBulkBytes = 64 * 1024;  // 16×64KB = 1MB
 
 // ---------------------------------------------------------------- socket 基础
 
@@ -747,6 +752,150 @@ uint64_t InfoMetric(const std::string& info, const std::string& key) {
   return static_cast<uint64_t>(std::stoull(info.substr(pos, end - pos)));
 }
 
+// ---------------------------------------------------------------- fd 继承检查
+
+// 遍历 /proc/<pid>/task/*/children 收集全部子进程 pid。
+// fork 发生在 IO 线程（bgrewriteaof/bgsave 都是 no-key 命令），子进程挂在
+// /proc/<pid>/task/<io_tid>/children，而不是 task/<pid>/children（主线程）。
+std::vector<pid_t> CollectChildren(pid_t server_pid) {
+  std::vector<pid_t> children;
+  std::string task_dir = "/proc/" + std::to_string(server_pid) + "/task";
+  std::error_code ec;
+  std::filesystem::directory_iterator it(task_dir, ec);
+  if (ec) return children;  // server 已退出，无 task 目录
+  for (const auto& t : it) {
+    std::ifstream f((t.path() / "children").string());
+    pid_t c;
+    while (f >> c) children.push_back(c);
+  }
+  return children;
+}
+
+// 轮询 task/*/children 取第一个子进程 pid；超时返回 -1。
+pid_t WaitChild(pid_t server_pid) {
+  for (int i = 0; i < 500; ++i) {
+    std::vector<pid_t> cs = CollectChildren(server_pid);
+    if (!cs.empty()) return cs[0];
+    ::usleep(1000);
+  }
+  return -1;
+}
+
+// 读 /proc/<pid>/fd/* 的 readlink 目标，返回是否含 socket。
+bool ChildHasSocket(pid_t child_pid) {
+  std::string fd_dir = "/proc/" + std::to_string(child_pid) + "/fd";
+  std::error_code ec;
+  std::filesystem::directory_iterator it(fd_dir, ec);
+  if (ec) return false;  // child 已退出，读不到即视为无 socket
+  char link[256];
+  for (const auto& e : it) {
+    std::string p = e.path().string();
+    ssize_t n = ::readlink(p.c_str(), link, sizeof link - 1);
+    if (n < 0) continue;
+    link[n] = '\0';
+    if (std::strncmp(link, "socket:[", 8) == 0) return true;
+  }
+  return false;
+}
+
+// SIGSTOP 冻结子进程直到观察到它不再持有 socket（说明 CloseInheritedFds 已跑过）。
+// 返回 true = 已冻结在「无 socket」状态；false = child 已退出或 5 次仍见 socket。
+// 重试防「SIGSTOP 盖在 CloseInheritedFds 前」的误红。
+bool FreezeChildPastCloseFds(pid_t child) {
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    if (::kill(child, SIGSTOP) != 0) return false;  // 已退出
+    if (!ChildHasSocket(child)) return true;         // 已过 CloseInheritedFds
+    ::kill(child, SIGCONT);                          // 还没过，放它再跑一步
+    ::usleep(1000);
+  }
+  ::kill(child, SIGCONT);
+  return false;
+}
+
+// 主测试：bgrewriteaof/bgsave 子进程不继承监听 socket（/proc/<child>/fd 无 socket 项）。
+void RunChildNoSocketFd(const std::string& cmd) {
+  CycleEnv e = MakeCycleEnv("always");
+  pid_t srv = SpawnServer(e.conf);
+  CrashServerGuard guard{srv, e.dir};
+  ASSERT_TRUE(WaitReady(e.port)) << "server failed to start";
+
+  {
+    Client c(e.port);
+    ASSERT_TRUE(c.ok());
+    std::string big(kFdCheckBulkBytes, 'z');
+    for (int i = 0; i < kFdCheckBulkKeys; ++i)
+      ASSERT_EQ(c.Do("SET", {"fd_bulk" + std::to_string(i), big}).kind, Reply::Kind::Simple);
+    Reply r = c.Do(cmd, {});
+    ASSERT_TRUE(r.kind == Reply::Kind::Simple || r.kind == Reply::Kind::Error)
+        << "unexpected reply to " << cmd;
+  }
+
+  pid_t child = WaitChild(srv);
+  ASSERT_GT(child, 0) << "no " << cmd << " child spawned";
+
+  ASSERT_TRUE(FreezeChildPastCloseFds(child))
+      << cmd << " child still holds a socket fd (CloseInheritedFds not effective)";
+  ::kill(child, SIGCONT);  // 恢复 child 正常收尾；CrashServerGuard 析构会 killpg 兜底
+}
+
+// bind + SO_REUSEADDR 试探端口是否可绑；无论成败都 close。返回是否 bind 成功。
+bool TryBind(int port) {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  int one = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  int r = ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr);
+  ::close(fd);  // bind 成功后记得 close
+  return r == 0;
+}
+
+// 辅助测试：rewrite/bgsave 期间 kill -9 父进程，端口应立即可重绑。
+// 用 bind 检查（不用 connect——connect 会因子进程继承的 listen socket 半开而成功/挂起）。
+void RunPortRebindAfterKill(const std::string& cmd) {
+  CycleEnv e = MakeCycleEnv("always");
+  pid_t srv = SpawnServer(e.conf);
+  CrashServerGuard guard{srv, e.dir};
+  ASSERT_TRUE(WaitReady(e.port)) << "server failed to start";
+
+  {
+    Client c(e.port);
+    ASSERT_TRUE(c.ok());
+    std::string big(kFdCheckBulkBytes, 'z');
+    for (int i = 0; i < kFdCheckBulkKeys; ++i)
+      ASSERT_EQ(c.Do("SET", {"fd_bulk" + std::to_string(i), big}).kind, Reply::Kind::Simple);
+    Reply r = c.Do(cmd, {});
+    ASSERT_TRUE(r.kind == Reply::Kind::Simple || r.kind == Reply::Kind::Error)
+        << "unexpected reply to " << cmd;
+  }
+
+  pid_t child = WaitChild(srv);
+  ASSERT_GT(child, 0) << "no " << cmd << " child spawned";
+
+  // 只杀父进程（server），让子进程继续活着（孤儿），观察它是否还占着监听端口。
+  ::kill(srv, SIGKILL);
+  int status = 0;
+  ::waitpid(srv, &status, 0);
+
+  // 重试：SIGSTOP 冻住孤儿 child → bind 试端口。若 EADDRINUSE（SIGSTOP 盖在
+  // CloseInheritedFds 前，child 尚持监听 fd）则 SIGCONT/sleep/再 SIGSTOP 重试。
+  bool bound = false;
+  for (int attempt = 0; attempt < 5 && !bound; ++attempt) {
+    if (::kill(child, SIGSTOP) != 0) break;  // child 已退出，本轮 inconclusive
+    bound = TryBind(e.port);
+    if (!bound) { ::kill(child, SIGCONT); ::usleep(1000); }
+  }
+  ::kill(child, SIGCONT);
+  ASSERT_TRUE(bound)
+      << cmd << ": port still held by orphan child (CloseInheritedFds not effective)";
+
+  // 清理孤儿子进程（其父已死，waitpid 由 init 兜底，这里只发信号）。
+  ::kill(child, SIGKILL);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- 测试
@@ -895,3 +1044,10 @@ TEST(CrashRecovery, MixedPipelineReplyOrder) {
     }
   }
 }
+
+// Bug 2 回归：rewrite/bgsave 子进程 fork 后必须关闭继承的监听 socket，
+// 否则父进程 kill -9 后端口仍被孤儿子进程占用，重启 EADDRINUSE。
+TEST(FdInherit, RewriteChildNoSocketFd) { RunChildNoSocketFd("bgrewriteaof"); }
+TEST(FdInherit, BgSaveChildNoSocketFd)   { RunChildNoSocketFd("bgsave"); }
+TEST(FdInherit, RewritePortRebindAfterKill) { RunPortRebindAfterKill("bgrewriteaof"); }
+TEST(FdInherit, BgSavePortRebindAfterKill)   { RunPortRebindAfterKill("bgsave"); }

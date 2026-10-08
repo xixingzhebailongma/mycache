@@ -1,8 +1,13 @@
 #include "mycache/persistence/persistence_manager.h"
 
+#include <fcntl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include "mycache/common/config.h"
@@ -15,6 +20,54 @@
 #include "mycache/persistence/rdb/rdb_writer.h"
 #include "mycache/persistence/snapshot_gate.h"
 #include "mycache/server/command_router.h"
+
+namespace {
+
+// 系统未装 <linux/dirent.h>（缺 linux-libc-dev），手动定义 getdents64 返回项。
+// 该布局是 UAPI ABI 稳定结构，d_name 最多 NAME_MAX+1（255+1）。
+struct LinuxDirent64 {
+  uint64_t d_ino;
+  int64_t d_off;
+  unsigned short d_reclen;
+  unsigned char d_type;
+  char d_name[256];
+};
+
+// 子进程 fork 后立即调用：关闭除 0/1/2 外全部继承 fd，避免 rewrite/bgsave 子进程
+// 持有父进程的监听 socket（父进程被 kill -9 后端口仍被孤儿子进程占用，重启 EADDRINUSE）。
+// 全程不 malloc：fork 时另一线程可能持 malloc arena 锁，只能用 syscall + 栈 buffer。
+void CloseInheritedFds() {
+  // 1) close_range（glibc ≥2.34 已声明，需 _GNU_SOURCE；Linux ≥5.9）。
+  if (::close_range(3, ~0U, 0) == 0) return;
+  if (errno != ENOSYS && errno != EINVAL) return;  // 真错误，放弃回退
+
+  // 2) 回退：getdents64 读 /proc/self/fd 把 fd 号收进栈数组，再统一关（不边遍历边关）。
+  int dir = ::open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dir < 0) return;
+  int fds[1024];
+  int n = 0;
+  char buf[4096];
+  for (;;) {
+    long len = ::syscall(SYS_getdents64, dir, buf, sizeof buf);
+    if (len <= 0) break;
+    for (long off = 0; off < len;) {
+      auto* d = reinterpret_cast<LinuxDirent64*>(buf + off);
+      int fd = std::atoi(d->d_name);
+      if (fd > 2 && fd != dir) {
+        if (n == 1024) {  // 满则 flush：先关掉已收这批再继续（处理 >1024 fd）
+          for (int i = 0; i < n; ++i) ::close(fds[i]);
+          n = 0;
+        }
+        fds[n++] = fd;
+      }
+      off += d->d_reclen;
+    }
+  }
+  ::close(dir);
+  for (int i = 0; i < n; ++i) ::close(fds[i]);
+}
+
+}  // namespace
 
 namespace mycache {
 
@@ -138,6 +191,7 @@ bool PersistenceManager::StartRewrite(std::string* err) {
 
   pid_t pid = ::fork();
   if (pid == 0) {
+    CloseInheritedFds();  // 先关继承 fd（监听 socket 等），再进 rewrite
     // 子进程：只做无分配操作，永不返回。
     RewriteAofChild(router_, child_tmp_path_.c_str(),
                     out_buf.data(), out_buf.size(), rec_buf.data(), rec_buf.size());
@@ -238,6 +292,7 @@ bool PersistenceManager::BgSave(std::string* err) {
 
   pid_t pid = ::fork();
   if (pid == 0) {
+    CloseInheritedFds();  // 先关继承 fd（监听 socket 等），再写 RDB
     WriteRdbChild(router_, child_tmp_path_.c_str(),
                   out_buf.data(), out_buf.size(), rec_buf.data(), rec_buf.size());
     // WriteRdbChild 内部 _exit，不会走到这里。
