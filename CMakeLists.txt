@@ -86,6 +86,14 @@ if(MYCACHE_BUILD_TESTS)
     MYCACHE_SERVER_PATH="${CMAKE_BINARY_DIR}/mycache-server")
   add_dependencies(mycache_tests mycache-server)
   add_test(NAME mycache_tests COMMAND mycache_tests)
+
+  # kill -9 崩溃恢复集成测试：独立二进制（不拖慢单测），ctest -R crash_recovery 可跑。
+  add_executable(mycache_crash_tests tests/integration/crash_recovery_test.cpp)
+  target_link_libraries(mycache_crash_tests PRIVATE mycache_core GTest::gtest GTest::gtest_main)
+  target_compile_definitions(mycache_crash_tests PRIVATE
+    MYCACHE_SERVER_PATH="${CMAKE_BINARY_DIR}/mycache-server")
+  add_dependencies(mycache_crash_tests mycache-server)
+  add_test(NAME crash_recovery COMMAND mycache_crash_tests)
 endif()
 
 # ---- 基准测试客户端 ----
