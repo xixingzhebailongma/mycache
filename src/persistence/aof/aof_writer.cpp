@@ -224,14 +224,14 @@ int AofWriter::WriteBatch(const std::vector<std::string>& batch) {
 
 void AofWriter::BeginRewrite() {
   std::unique_lock<std::mutex> lock(mu_);
-  io_done_cv_.wait(lock, [this] { return !io_in_flight_; });  // fork 前不留 in-flight AOF IO
+  io_done_cv_.wait(lock, [this] { return !io_in_flight_ && pending_.empty(); });  // fork 前不留 in-flight AOF IO，且 pending_ 排空（防快照丢记录）
   rewriting_ = true;
   rewrite_buffer_.clear();
 }
 
 bool AofWriter::CompleteRewrite(const std::string& temp_path) {
   std::unique_lock<std::mutex> lock(mu_);
-  io_done_cv_.wait(lock, [this] { return !io_in_flight_; });  // 换 fd 前等锁外 IO 结束
+  io_done_cv_.wait(lock, [this] { return !io_in_flight_ && pending_.empty(); });  // 换 fd 前等锁外 IO 结束，且 pending_ 排空（防同一批重复写）
   if (fd_ < 0) {                       // AOF 已关闭（不应发生）：temp 仍可能是子进程产物，一并清理
     ::unlink(temp_path.c_str());
     return false;

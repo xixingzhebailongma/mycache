@@ -9,7 +9,9 @@ namespace mycache {
 // malloc/free/malloc_usable_size 的簿记。返回指针与 malloc 同为 16 字节对齐。
 //
 // 关键不变量：一块内存必须由「同一线程分配、同一线程释放」（thread_local 池）。
-// 跨线程 free 的池块 magic 校验失败，按真实块走 free()，安全降级而非 crash。
+// 该不变量靠对象所有权设计保证（对象在归属线程创建/销毁，共享对象永不 free），
+// 无运行时兜底：magic 只区分池块与真实 malloc 块，跨线程 free 不被识别，
+// 会静默污染对方 freelist 且本线程丢块（不 crash，故更隐蔽）。
 
 // 池上限：> 4096 一律直连（页边界，见 docs/memory-pool.md）。
 inline constexpr uint32_t kMaxPoolSize = 4096;

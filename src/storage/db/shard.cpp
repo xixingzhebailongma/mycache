@@ -126,7 +126,10 @@ Object* Shard::LookupValue(sds key) {
   DictEntry* e = dict_.FindAndRehash(key);
   if (!e) return nullptr;
   Object* o = static_cast<Object*>(e->val);
-  o->lru = LruClock();  // 访问即刷新 LRU
+  // 共享对象（refcount == kSharedRefCount，如共享整数池）可能被多个 shard 的 key
+  // 同时引用；无条件写 lru 会形成跨线程数据竞争。与 Redis lookupKey 一致，仅对
+  // 非共享对象刷新 LRU（共享对象永不参与 LRU 淘汰，无需刷新）。
+  if (o->refcount != kSharedRefCount) o->lru = LruClock();
   return o;
 }
 
